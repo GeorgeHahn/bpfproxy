@@ -1,0 +1,25 @@
+FROM ubuntu:24.04
+
+RUN apt-get update && apt-get install -y \
+    curl \
+    wget \
+    netcat-openbsd \
+    iperf3 \
+    iputils-ping \
+    apache2-utils \
+    tcpdump \
+    iproute2 \
+    python3 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create directory for HTTP server
+RUN mkdir -p /var/www && echo "Hello from BPF test server!" > /var/www/index.html
+
+# Copy custom HTTP server
+COPY http_server.py /usr/local/bin/http_server.py
+RUN chmod +x /usr/local/bin/http_server.py
+
+WORKDIR /root
+
+# Keep container running
+CMD ["tail", "-f", "/dev/null"]

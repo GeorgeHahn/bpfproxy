@@ -1,0 +1,23 @@
+services:
+  traffic-gen:
+    build:
+      context: .
+      dockerfile: Dockerfile.traffic-gen
+    container_name: bpf-traffic-gen
+    network_mode: bridge
+    cap_add:
+      - NET_ADMIN
+    stdin_open: true
+    tty: true
+
+  target-server:
+    build:
+      context: .
+      dockerfile: Dockerfile.traffic-gen
+    container_name: bpf-target-server
+    network_mode: bridge
+    cap_add:
+      - NET_ADMIN
+    stdin_open: true
+    tty: true
+    command: python3 /usr/local/bin/http_server.py
