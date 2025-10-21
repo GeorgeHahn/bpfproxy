@@ -6,10 +6,12 @@ A high-performance eBPF program for monitoring network connections with containe
 
 This monitor follows **eBPF best practices** by hooking connection events directly rather than interfaces:
 
-- **Outbound connections**: `cgroup/connect4` and `cgroup/connect6` hooks (BPF_CGROUP_SOCK_ADDR)
+- **Outbound connections**: `cgroup/connect4` hook for IPv4 (BPF_CGROUP_SOCK_ADDR)
 - **State changes**: `tracepoint sock:inet_sock_set_state` for tracking connection lifecycle
 - **Inbound connections**: `kprobe` on `inet_csk_accept` for accepted connections
 - **Container attribution**: Uses cgroup ID (`bpf_get_current_cgroup_id()`) and network namespace cookies (`bpf_get_netns_cookie()`)
+
+**Note**: Currently only IPv4 connections are monitored. IPv6 support is planned for a future release.
 
 This approach provides:
 - ✅ Interface-independent monitoring
@@ -72,9 +74,10 @@ In another terminal:
 ### Hook Points
 
 1. **cgroup/connect4**: Intercepts outbound IPv4 connection attempts
-2. **cgroup/connect6**: Intercepts outbound IPv6 connection attempts
-3. **sock:inet_sock_set_state**: Tracks all TCP state transitions
-4. **inet_csk_accept**: Captures inbound connection accepts
+2. **sock:inet_sock_set_state**: Tracks all TCP state transitions
+3. **inet_csk_accept**: Captures inbound connection accepts
+
+**Note**: IPv6 connections (cgroup/connect6) are not currently monitored.
 
 ### Container Attribution
 

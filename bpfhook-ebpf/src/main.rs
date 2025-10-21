@@ -33,14 +33,6 @@ pub struct ConnectionInfo {
 pub struct ConnectionMetrics {
     pub total_connections: u64,
     pub active_connections: u64,
-    pub bytes_sent: u64,
-    pub bytes_received: u64,
-    pub http_requests: u64,
-    pub get_requests: u64,
-    pub post_requests: u64,
-    pub put_requests: u64,
-    pub delete_requests: u64,
-    pub other_requests: u64,
     pub last_updated: u64,
 }
 
@@ -80,12 +72,25 @@ fn gen_conn_id(src_addr: u32, dst_addr: u32, src_port: u16, dst_port: u16) -> u6
     ((src_addr as u64) << 32) | ((dst_addr as u64) << 16) | ((src_port as u64) << 8) | (dst_port as u64)
 }
 
-// Check if this is a container based on cgroup path or namespace
+// Check if this is a container based on cgroup and network namespace
 #[inline(always)]
 fn is_container_connection(cgroup_id: u64, netns_cookie: u64) -> bool {
-    // Simple heuristic: non-root cgroup or non-default netns indicates container
-    // In production, you'd want more sophisticated checks
-    cgroup_id != 1 || netns_cookie != 0
+    // Improved container detection heuristic:
+    // 1. Root cgroup (ID 1) is definitely not a container
+    // 2. Very high cgroup IDs (> 4096) are likely containers (systemd uses lower IDs)
+    // 3. Non-zero network namespace cookie indicates a custom namespace (likely container)
+    //
+    // Note: This is still a heuristic. For production use, consider:
+    // - Reading cgroup path and checking for /docker/, /kubepods/, /containerd/, etc.
+    // - Maintaining a map of known container cgroup IDs
+    // - Using additional signals like mount namespace, PID namespace, etc.
+
+    if cgroup_id == 1 {
+        return false;  // Root cgroup is definitely not a container
+    }
+
+    // High cgroup IDs or custom network namespaces likely indicate containers
+    cgroup_id > 4096 || netns_cookie != 0
 }
 
 
@@ -153,11 +158,42 @@ fn try_bpfhook_connect4(ctx: SockAddrContext) -> Result<i32, i64> {
     Ok(1)
 }
 
-// Hook for outbound IPv6 connections (cgroup/connect6)
-#[cgroup_sock_addr(connect6)]
-pub fn bpfhook_connect6(_ctx: SockAddrContext) -> i32 {
-    // For now, we'll focus on IPv4. IPv6 can be added similarly
-    1
+// IPv6 support is not currently implemented
+// TODO: Add IPv6 support by implementing cgroup/connect6 hook
+// This would require handling IPv6 addresses (128-bit) and updating
+// data structures to support both IPv4 and IPv6
+
+// Tracepoint field offsets for sock:inet_sock_set_state
+// These offsets are for the standard kernel tracepoint structure:
+// struct trace_event_raw_inet_sock_set_state {
+//     struct trace_entry ent;  // 8 bytes
+//     int oldstate;            // 4 bytes at offset 8
+//     int newstate;            // 4 bytes at offset 12
+//     __u16 sport;             // 2 bytes at offset 16
+//     __u16 dport;             // 2 bytes at offset 18
+//     __u16 family;            // 2 bytes at offset 20
+//     __u8 protocol;           // 1 byte at offset 22
+//     // padding              // 1 byte at offset 23
+//     __u8 saddr[4];          // 4 bytes at offset 24 (IPv4) or 16 bytes (IPv6)
+//     __u8 daddr[4];          // 4 bytes at offset 40 (IPv4) or 16 bytes (IPv6)
+// }
+const TRACEPOINT_OFFSET_OLDSTATE: usize = 8;
+const TRACEPOINT_OFFSET_NEWSTATE: usize = 12;
+const TRACEPOINT_OFFSET_SPORT: usize = 16;
+const TRACEPOINT_OFFSET_DPORT: usize = 18;
+const TRACEPOINT_OFFSET_FAMILY: usize = 20;
+const TRACEPOINT_OFFSET_PROTOCOL: usize = 22;
+const TRACEPOINT_OFFSET_SADDR_IPV4: usize = 24;
+const TRACEPOINT_OFFSET_DADDR_IPV4: usize = 40;
+
+// Helper macro for safe kernel reads with validation
+macro_rules! read_kernel_field {
+    ($ctx:expr, $offset:expr, $type:ty) => {
+        unsafe {
+            let ptr = $ctx.as_ptr().add($offset) as *const $type;
+            bpf_probe_read_kernel(ptr).unwrap_or(0 as $type)
+        }
+    };
 }
 
 // Tracepoint for socket state changes
@@ -171,44 +207,31 @@ pub fn bpfhook_sock_state(ctx: TracePointContext) -> u32 {
 
 fn try_bpfhook_sock_state(ctx: TracePointContext) -> Result<u32, i64> {
     // The tracepoint args structure for sock:inet_sock_set_state
-    // Contains: oldstate, newstate, sport, dport, family, protocol, saddr[], daddr[]
+    // Read fields using defined offsets for better maintainability
 
-    // Read the new state (offset 8 bytes from start of args)
-    let newstate: i32 = unsafe {
-        let ptr = ctx.as_ptr().add(8) as *const i32;
-        bpf_probe_read_kernel(ptr).unwrap_or(0)
-    };
+    // Read the new state
+    let newstate: i32 = read_kernel_field!(ctx, TRACEPOINT_OFFSET_NEWSTATE, i32);
 
-    // Read source and dest ports (offsets 16 and 18)
-    let sport: u16 = unsafe {
-        let sport_ptr = ctx.as_ptr().add(16) as *const u16;
-        bpf_probe_read_kernel(sport_ptr).unwrap_or(0)
-    };
-    let dport: u16 = unsafe {
-        let dport_ptr = ctx.as_ptr().add(18) as *const u16;
-        bpf_probe_read_kernel(dport_ptr).unwrap_or(0)
-    };
+    // Validate state is within expected range
+    if newstate < 0 || newstate > 11 {
+        return Ok(0); // Invalid state, skip
+    }
 
-    // Read family (offset 20)
-    let family: u16 = unsafe {
-        let family_ptr = ctx.as_ptr().add(20) as *const u16;
-        bpf_probe_read_kernel(family_ptr).unwrap_or(0)
-    };
+    // Read source and dest ports
+    let sport: u16 = read_kernel_field!(ctx, TRACEPOINT_OFFSET_SPORT, u16);
+    let dport: u16 = read_kernel_field!(ctx, TRACEPOINT_OFFSET_DPORT, u16);
+
+    // Read family
+    let family: u16 = read_kernel_field!(ctx, TRACEPOINT_OFFSET_FAMILY, u16);
 
     // Only handle IPv4 TCP
     if family != AF_INET {
         return Ok(0);
     }
 
-    // Read source and dest addresses for IPv4 (offsets 24 and 40)
-    let saddr: u32 = unsafe {
-        let saddr_ptr = ctx.as_ptr().add(24) as *const u32;
-        bpf_probe_read_kernel(saddr_ptr).unwrap_or(0)
-    };
-    let daddr: u32 = unsafe {
-        let daddr_ptr = ctx.as_ptr().add(40) as *const u32;
-        bpf_probe_read_kernel(daddr_ptr).unwrap_or(0)
-    };
+    // Read source and dest addresses for IPv4
+    let saddr: u32 = read_kernel_field!(ctx, TRACEPOINT_OFFSET_SADDR_IPV4, u32);
+    let daddr: u32 = read_kernel_field!(ctx, TRACEPOINT_OFFSET_DADDR_IPV4, u32);
 
     // Get process and container info
     let pid_tgid = bpf_get_current_pid_tgid();
@@ -306,14 +329,6 @@ fn update_metrics(cgroup_id: u64, netns_cookie: u64, is_connect: bool, is_establ
         let mut metrics = METRICS_BY_CGROUP.get(&cgroup_id).copied().unwrap_or(ConnectionMetrics {
             total_connections: 0,
             active_connections: 0,
-            bytes_sent: 0,
-            bytes_received: 0,
-            http_requests: 0,
-            get_requests: 0,
-            post_requests: 0,
-            put_requests: 0,
-            delete_requests: 0,
-            other_requests: 0,
             last_updated: 0,
         });
 
@@ -334,14 +349,6 @@ fn update_metrics(cgroup_id: u64, netns_cookie: u64, is_connect: bool, is_establ
             let mut metrics = METRICS_BY_NETNS.get(&netns_cookie).copied().unwrap_or(ConnectionMetrics {
                 total_connections: 0,
                 active_connections: 0,
-                bytes_sent: 0,
-                bytes_received: 0,
-                http_requests: 0,
-                get_requests: 0,
-                post_requests: 0,
-                put_requests: 0,
-                delete_requests: 0,
-                other_requests: 0,
                 last_updated: 0,
             });
 

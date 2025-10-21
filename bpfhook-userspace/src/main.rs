@@ -50,14 +50,6 @@ unsafe impl Pod for ConnectionInfo {}
 pub struct ConnectionMetrics {
     pub total_connections: u64,
     pub active_connections: u64,
-    pub bytes_sent: u64,
-    pub bytes_received: u64,
-    pub http_requests: u64,
-    pub get_requests: u64,
-    pub post_requests: u64,
-    pub put_requests: u64,
-    pub delete_requests: u64,
-    pub other_requests: u64,
     pub last_updated: u64,
 }
 
@@ -204,11 +196,11 @@ fn load_ebpf_program(path: &Path) -> Result<Ebpf> {
 
 /// Attach all eBPF programs to their respective hooks
 fn attach_all_programs(ebpf: &mut Ebpf, cgroup_path: &str) -> Result<()> {
-    // Attach cgroup/connect4 hook
+    // Attach cgroup/connect4 hook for IPv4 connections
     attach_cgroup_connect4(ebpf, cgroup_path)?;
 
-    // Attach cgroup/connect6 hook (for IPv6 support)
-    attach_cgroup_connect6(ebpf, cgroup_path)?;
+    // Note: IPv6 support (cgroup/connect6) is not currently implemented
+    // TODO: Add IPv6 support in future versions
 
     // Attach tracepoint for socket state changes
     attach_sock_state_tracepoint(ebpf)?;
@@ -240,26 +232,8 @@ fn attach_cgroup_connect4(ebpf: &mut Ebpf, cgroup_path: &str) -> Result<()> {
     Ok(())
 }
 
-/// Attach the cgroup/connect6 program
-fn attach_cgroup_connect6(ebpf: &mut Ebpf, cgroup_path: &str) -> Result<()> {
-    let program: &mut CgroupSockAddr = ebpf
-        .program_mut("bpfhook_connect6")
-        .context("Failed to find 'bpfhook_connect6' program")?
-        .try_into()
-        .context("Failed to convert to CgroupSockAddr program")?;
-
-    let cgroup = std::fs::File::open(cgroup_path)
-        .with_context(|| format!("Failed to open cgroup path: {}", cgroup_path))?;
-
-    program.load()
-        .context("Failed to load cgroup/connect6 program")?;
-
-    program.attach(cgroup, CgroupAttachMode::Single)
-        .context("Failed to attach cgroup/connect6 program")?;
-
-    info!("Attached cgroup/connect6 hook");
-    Ok(())
-}
+// IPv6 support (cgroup/connect6) is not currently implemented
+// TODO: Implement attach_cgroup_connect6 when IPv6 support is added
 
 /// Attach the tracepoint for socket state changes
 fn attach_sock_state_tracepoint(ebpf: &mut Ebpf) -> Result<()> {
@@ -333,11 +307,22 @@ fn spawn_event_processor(ebpf: &mut Ebpf) -> Result<task::JoinHandle<()>> {
         // Open perf buffers for all CPUs
         let mut buffers = Vec::new();
         for cpu_id in cpus {
-            let buf = perf_array.open(cpu_id, None).unwrap();
-            buffers.push(buf);
+            match perf_array.open(cpu_id, None) {
+                Ok(buf) => {
+                    buffers.push(buf);
+                }
+                Err(e) => {
+                    warn!("Failed to open perf buffer for CPU {}: {}. Continuing with other CPUs.", cpu_id, e);
+                }
+            }
         }
 
-        info!("Started connection event processor");
+        if buffers.is_empty() {
+            warn!("Failed to open any perf buffers. Event processing disabled.");
+            return;
+        }
+
+        info!("Started connection event processor with {} CPU buffers", buffers.len());
 
         let bufs = (0..buffers.len())
             .map(|_| BytesMut::with_capacity(1024))
@@ -510,14 +495,6 @@ fn print_cgroup_metrics(map: &HashMap<&MapData, u64, ConnectionMetrics>, show_co
     let mut total = ConnectionMetrics {
         total_connections: 0,
         active_connections: 0,
-        bytes_sent: 0,
-        bytes_received: 0,
-        http_requests: 0,
-        get_requests: 0,
-        post_requests: 0,
-        put_requests: 0,
-        delete_requests: 0,
-        other_requests: 0,
         last_updated: 0,
     };
 
@@ -528,8 +505,6 @@ fn print_cgroup_metrics(map: &HashMap<&MapData, u64, ConnectionMetrics>, show_co
         // Accumulate totals
         total.total_connections += metrics.total_connections;
         total.active_connections += metrics.active_connections;
-        total.bytes_sent += metrics.bytes_sent;
-        total.bytes_received += metrics.bytes_received;
     }
 
     println!("\nCgroup-based Metrics:");
@@ -549,10 +524,6 @@ fn print_cgroup_metrics(map: &HashMap<&MapData, u64, ConnectionMetrics>, show_co
     println!("\n  Aggregate Metrics:");
     println!("    Total Connections:  {}", total.total_connections);
     println!("    Active Connections: {}", total.active_connections);
-    if total.bytes_sent > 0 || total.bytes_received > 0 {
-        println!("    Bytes Sent:         {}", total.bytes_sent);
-        println!("    Bytes Received:     {}", total.bytes_received);
-    }
 
     Ok(())
 }
