@@ -4,9 +4,9 @@
 use aya_ebpf::{
     bindings::BPF_F_CURRENT_CPU,
     helpers::{bpf_get_current_cgroup_id, bpf_get_current_pid_tgid, bpf_ktime_get_ns, bpf_probe_read_kernel},
-    macros::{cgroup_sock_addr, kprobe, map, tracepoint},
+    macros::{cgroup_sock_addr, map, tracepoint},
     maps::{HashMap, LruHashMap, PerfEventArray},
-    programs::{SockAddrContext, ProbeContext, TracePointContext},
+    programs::{SockAddrContext, TracePointContext},
     EbpfContext,
 };
 
@@ -34,6 +34,15 @@ pub struct ConnectionMetrics {
     pub total_connections: u64,
     pub active_connections: u64,
     pub last_updated: u64,
+}
+
+// Proxy configuration for redirection
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ProxyConfig {
+    pub proxy_addr: u32,  // IPv4 address of proxy
+    pub proxy_port: u16,  // Port of proxy
+    pub enabled: bool,    // Whether redirection is enabled
 }
 
 // Socket state values from Linux kernel
@@ -65,6 +74,14 @@ static mut METRICS_BY_NETNS: HashMap<u64, ConnectionMetrics> = HashMap::with_max
 
 #[map]
 static mut CONNECTION_EVENTS: PerfEventArray<ConnectionInfo> = PerfEventArray::new(0);
+
+// Container filtering map - if non-empty, only PIDs in this map are intercepted
+#[map]
+static mut ALLOWED_PIDS: HashMap<u32, u8> = HashMap::with_max_entries(1024, 0);
+
+// Proxy configuration map - stores proxy address to redirect to
+#[map]
+static mut PROXY_CONFIG: HashMap<u32, ProxyConfig> = HashMap::with_max_entries(1, 0);
 
 // Generate unique connection ID from 4-tuple
 #[inline(always)]
@@ -104,7 +121,7 @@ pub fn bpfhook_connect4(ctx: SockAddrContext) -> i32 {
 }
 
 fn try_bpfhook_connect4(ctx: SockAddrContext) -> Result<i32, i64> {
-    let sock_addr = unsafe { &*ctx.sock_addr };
+    let sock_addr = unsafe { &mut *ctx.sock_addr };
 
     // Only handle IPv4
     if sock_addr.family != (AF_INET as u32) {
@@ -117,13 +134,45 @@ fn try_bpfhook_connect4(ctx: SockAddrContext) -> Result<i32, i64> {
     let tid = pid_tgid as u32;
     let cgroup_id = unsafe { bpf_get_current_cgroup_id() };
 
+    // Check if container filtering is enabled by looking for the PID in the map
+    // If the map is empty (no filtering), the get will return None for all PIDs
+    // We use a special key (0) to indicate if filtering is enabled
+    unsafe {
+        let filter_key = 0u32;
+        let filtering_enabled = ALLOWED_PIDS.get(&filter_key).is_some();
+
+        if filtering_enabled {
+            // Check if this specific PID is allowed
+            if ALLOWED_PIDS.get(&pid).is_none() {
+                return Ok(1); // Not intercepting this connection
+            }
+        }
+    }
+
     // For cgroup/connect hooks, we don't have direct socket access
     // So we'll set netns_cookie to 0 and rely on cgroup_id for container attribution
     let netns_cookie = 0u64;
 
-    // Read destination address from context
-    let dst_addr = u32::from_be(sock_addr.user_ip4);
-    let dst_port = u16::from_be(sock_addr.user_port as u16);
+    // Read original destination address from context
+    let orig_dst_addr = u32::from_be(sock_addr.user_ip4);
+    let orig_dst_port = u16::from_be(sock_addr.user_port as u16);
+
+    // Check if proxy redirection is enabled
+    let (dst_addr, dst_port) = unsafe {
+        let key = 0u32;
+        if let Some(proxy) = PROXY_CONFIG.get(&key) {
+            if proxy.enabled {
+                // Redirect to proxy - modify the destination address
+                sock_addr.user_ip4 = proxy.proxy_addr.to_be();
+                sock_addr.user_port = (proxy.proxy_port as u32).to_be();
+                (proxy.proxy_addr, proxy.proxy_port)
+            } else {
+                (orig_dst_addr, orig_dst_port)
+            }
+        } else {
+            (orig_dst_addr, orig_dst_port)
+        }
+    };
 
     // For connect, source port is usually assigned by kernel, we'll track in state change
     let conn_info = ConnectionInfo {
@@ -132,9 +181,9 @@ fn try_bpfhook_connect4(ctx: SockAddrContext) -> Result<i32, i64> {
         cgroup_id,
         netns_cookie,
         src_addr: 0, // Will be filled during state change
-        dst_addr,
+        dst_addr: orig_dst_addr, // Store original destination for tracking
         src_port: 0, // Will be filled during state change
-        dst_port,
+        dst_port: orig_dst_port, // Store original port for tracking
         protocol: 6, // TCP
         state: TCP_SYN_SENT,
         timestamp: unsafe { bpf_ktime_get_ns() },
@@ -142,7 +191,7 @@ fn try_bpfhook_connect4(ctx: SockAddrContext) -> Result<i32, i64> {
     };
 
     // Store connection info
-    let conn_id = gen_conn_id(0, dst_addr, 0, dst_port);
+    let conn_id = gen_conn_id(0, orig_dst_addr, 0, orig_dst_port);
     unsafe {
         CONNECTION_MAP.insert(&conn_id, &conn_info, 0)?;
     }
@@ -276,49 +325,6 @@ fn try_bpfhook_sock_state(ctx: TracePointContext) -> Result<u32, i64> {
     Ok(0)
 }
 
-// Kprobe for inbound connections (inet_csk_accept)
-#[kprobe]
-pub fn bpfhook_accept(ctx: ProbeContext) -> u32 {
-    match try_bpfhook_accept(ctx) {
-        Ok(ret) => ret,
-        Err(_) => 0,
-    }
-}
-
-fn try_bpfhook_accept(ctx: ProbeContext) -> Result<u32, i64> {
-    // Get process and container info
-    let pid_tgid = bpf_get_current_pid_tgid();
-    let pid = (pid_tgid >> 32) as u32;
-    let tid = pid_tgid as u32;
-    let cgroup_id = unsafe { bpf_get_current_cgroup_id() };
-
-    // For accept, we track that this process accepted a connection
-    // The actual connection details will come from state changes
-    let conn_info = ConnectionInfo {
-        pid,
-        tid,
-        cgroup_id,
-        netns_cookie: 0,
-        src_addr: 0,
-        dst_addr: 0,
-        src_port: 0,
-        dst_port: 0,
-        protocol: 6, // TCP
-        state: TCP_ESTABLISHED,
-        timestamp: unsafe { bpf_ktime_get_ns() },
-        is_container: is_container_connection(cgroup_id, 0),
-    };
-
-    // Send accept event to userspace
-    unsafe {
-        CONNECTION_EVENTS.output(&ctx, &conn_info, BPF_F_CURRENT_CPU as u32);
-    }
-
-    // Update metrics for inbound connection
-    update_metrics(cgroup_id, 0, false, true);
-
-    Ok(0)
-}
 
 // Helper function to update metrics
 fn update_metrics(cgroup_id: u64, netns_cookie: u64, is_connect: bool, is_established: bool) {

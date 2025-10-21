@@ -1,12 +1,12 @@
-//! Userspace component for connection monitoring with eBPF
+//! Userspace component for outbound connection monitoring with eBPF
 //!
-//! This program loads eBPF programs that hook connection events (connect/accept/state changes)
-//! to monitor network traffic with container attribution.
+//! This program loads eBPF programs that hook outbound connection events (connect/state changes)
+//! to monitor and potentially redirect network traffic with container attribution.
 
 use anyhow::{Context, Result};
 use aya::{
     maps::{HashMap, MapData, AsyncPerfEventArray},
-    programs::{CgroupSockAddr, CgroupAttachMode, KProbe, TracePoint},
+    programs::{CgroupSockAddr, CgroupAttachMode, TracePoint},
     util::online_cpus,
     Ebpf, Pod,
 };
@@ -22,6 +22,7 @@ use std::{
     time::Duration,
 };
 use tokio::{signal, time, task};
+use std::process::Command;
 
 // Connection info structure matching the eBPF side
 #[derive(Debug, Clone, Copy)]
@@ -56,6 +57,18 @@ pub struct ConnectionMetrics {
 // SAFETY: ConnectionMetrics is a plain C struct, safe for Pod
 unsafe impl Pod for ConnectionMetrics {}
 
+// Proxy configuration structure matching the eBPF side
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+pub struct ProxyConfig {
+    pub proxy_addr: u32,  // IPv4 address of proxy
+    pub proxy_port: u16,  // Port of proxy
+    pub enabled: bool,    // Whether redirection is enabled
+}
+
+// SAFETY: ProxyConfig is a plain C struct, safe for Pod
+unsafe impl Pod for ProxyConfig {}
+
 // TCP state names for display
 const TCP_STATES: &[&str] = &[
     "UNKNOWN",
@@ -75,7 +88,7 @@ const TCP_STATES: &[&str] = &[
 #[derive(Parser, Debug)]
 #[clap(
     name = "bpfhook",
-    about = "Connection monitor using eBPF with container attribution",
+    about = "Outbound connection interceptor with container filtering and proxy redirection",
     version,
     author
 )]
@@ -99,6 +112,14 @@ struct Args {
     /// Path to the eBPF program binary (can also set via EBPF_PATH env var)
     #[clap(short = 'p', long)]
     ebpf_path: Option<PathBuf>,
+
+    /// Container name to filter (only intercept connections from this container)
+    #[clap(long)]
+    container: Option<String>,
+
+    /// Proxy address to redirect connections to (format: IP:PORT)
+    #[clap(long)]
+    proxy: Option<String>,
 }
 
 #[tokio::main]
@@ -122,8 +143,25 @@ async fn main() -> Result<()> {
     // Load and attach all the eBPF programs
     attach_all_programs(&mut ebpf, &args.cgroup_path)?;
 
+    // Configure container filtering if specified
+    if let Some(ref container_name) = args.container {
+        configure_container_filtering(&mut ebpf, container_name)?;
+    }
+
+    // Configure proxy redirection if specified
+    if let Some(ref proxy_addr) = args.proxy {
+        configure_proxy_redirection(&mut ebpf, proxy_addr)?;
+    }
+
     info!("eBPF programs attached successfully.");
-    info!("Monitoring connections with container attribution.");
+    if let Some(ref container_name) = args.container {
+        info!("Filtering connections from container: {}", container_name);
+    } else {
+        info!("Monitoring all outbound connections");
+    }
+    if let Some(ref proxy_addr) = args.proxy {
+        info!("Redirecting to proxy: {}", proxy_addr);
+    }
     info!("Press Ctrl-C to exit.\n");
 
     // Start event processing if requested (do this before getting maps to avoid borrow conflict)
@@ -199,14 +237,8 @@ fn attach_all_programs(ebpf: &mut Ebpf, cgroup_path: &str) -> Result<()> {
     // Attach cgroup/connect4 hook for IPv4 connections
     attach_cgroup_connect4(ebpf, cgroup_path)?;
 
-    // Note: IPv6 support (cgroup/connect6) is not currently implemented
-    // TODO: Add IPv6 support in future versions
-
     // Attach tracepoint for socket state changes
     attach_sock_state_tracepoint(ebpf)?;
-
-    // Attach kprobe for accept
-    attach_accept_kprobe(ebpf)?;
 
     Ok(())
 }
@@ -253,23 +285,6 @@ fn attach_sock_state_tracepoint(ebpf: &mut Ebpf) -> Result<()> {
     Ok(())
 }
 
-/// Attach the kprobe for accept
-fn attach_accept_kprobe(ebpf: &mut Ebpf) -> Result<()> {
-    let program: &mut KProbe = ebpf
-        .program_mut("bpfhook_accept")
-        .context("Failed to find 'bpfhook_accept' program")?
-        .try_into()
-        .context("Failed to convert to KProbe program")?;
-
-    program.load()
-        .context("Failed to load inet_csk_accept kprobe")?;
-
-    program.attach("inet_csk_accept", 0)
-        .context("Failed to attach inet_csk_accept kprobe")?;
-
-    info!("Attached inet_csk_accept kprobe");
-    Ok(())
-}
 
 /// Get the connection map
 fn get_connection_map(ebpf: &Ebpf) -> Result<HashMap<&MapData, u64, ConnectionInfo>> {
@@ -554,6 +569,173 @@ fn print_netns_metrics(map: &HashMap<&MapData, u64, ConnectionMetrics>) -> Resul
     }
 
     println!("  Total connections across namespaces: {}", total_by_ns);
+
+    Ok(())
+}
+
+/// Configure container filtering by populating the ALLOWED_PIDS map
+fn configure_container_filtering(ebpf: &mut Ebpf, container_name: &str) -> Result<()> {
+    // Get container PIDs
+    let pids = get_container_pids(container_name)?;
+
+    if pids.is_empty() {
+        anyhow::bail!("No processes found for container: {}", container_name);
+    }
+
+    // Get the ALLOWED_PIDS map
+    let mut allowed_pids: HashMap<_, u32, u8> = HashMap::try_from(
+        ebpf.map_mut("ALLOWED_PIDS")
+            .context("Failed to find ALLOWED_PIDS map")?
+    ).context("Failed to create HashMap from ALLOWED_PIDS")?;
+
+    // Add a special key (0) to indicate filtering is enabled
+    allowed_pids.insert(&0u32, &1u8, 0)
+        .context("Failed to enable filtering flag in ALLOWED_PIDS map")?;
+
+    // Add all PIDs to the map
+    for pid in &pids {
+        allowed_pids.insert(pid, &1u8, 0)
+            .with_context(|| format!("Failed to add PID {} to ALLOWED_PIDS map", pid))?;
+    }
+
+    info!("Added {} PIDs from container '{}' to filter", pids.len(), container_name);
+    debug!("PIDs: {:?}", pids);
+
+    Ok(())
+}
+
+/// Get all PIDs for a given container name
+fn get_container_pids(container_name: &str) -> Result<Vec<u32>> {
+    // Try Docker first
+    if let Ok(pids) = get_docker_container_pids(container_name) {
+        if !pids.is_empty() {
+            return Ok(pids);
+        }
+    }
+
+    // Try containerd if Docker didn't work
+    if let Ok(pids) = get_containerd_container_pids(container_name) {
+        if !pids.is_empty() {
+            return Ok(pids);
+        }
+    }
+
+    anyhow::bail!("Container '{}' not found. Make sure it's running.", container_name)
+}
+
+/// Get PIDs from Docker container
+fn get_docker_container_pids(container_name: &str) -> Result<Vec<u32>> {
+    // First, get the container ID or use the name directly
+    let output = Command::new("docker")
+        .args(&["inspect", "-f", "{{.State.Pid}}", container_name])
+        .output()?;
+
+    if !output.status.success() {
+        return Err(anyhow::anyhow!("Docker inspect failed"));
+    }
+
+    let main_pid = String::from_utf8(output.stdout)?
+        .trim()
+        .parse::<u32>()
+        .context("Failed to parse main PID")?;
+
+    if main_pid == 0 {
+        return Err(anyhow::anyhow!("Container not running"));
+    }
+
+    // Get all PIDs in the container's PID namespace
+    let mut pids = vec![main_pid];
+
+    // Read all PIDs from the container's cgroup
+    let cgroup_procs_path = format!("/sys/fs/cgroup/system.slice/docker-{}.scope/cgroup.procs",
+                                   get_docker_container_id(container_name)?);
+
+    if Path::new(&cgroup_procs_path).exists() {
+        let contents = std::fs::read_to_string(&cgroup_procs_path)?;
+        for line in contents.lines() {
+            if let Ok(pid) = line.trim().parse::<u32>() {
+                pids.push(pid);
+            }
+        }
+    } else {
+        // Try alternative cgroup path
+        let alt_path = format!("/sys/fs/cgroup/docker/{}/cgroup.procs",
+                              get_docker_container_id(container_name)?);
+        if Path::new(&alt_path).exists() {
+            let contents = std::fs::read_to_string(&alt_path)?;
+            for line in contents.lines() {
+                if let Ok(pid) = line.trim().parse::<u32>() {
+                    pids.push(pid);
+                }
+            }
+        }
+    }
+
+    Ok(pids)
+}
+
+/// Get full container ID from name
+fn get_docker_container_id(container_name: &str) -> Result<String> {
+    let output = Command::new("docker")
+        .args(&["ps", "-aq", "--filter", &format!("name={}", container_name)])
+        .output()?;
+
+    if !output.status.success() {
+        return Err(anyhow::anyhow!("Docker ps failed"));
+    }
+
+    let id = String::from_utf8(output.stdout)?.trim().to_string();
+    if id.is_empty() {
+        return Err(anyhow::anyhow!("Container not found"));
+    }
+
+    Ok(id)
+}
+
+/// Get PIDs from containerd container (placeholder for now)
+fn get_containerd_container_pids(_container_name: &str) -> Result<Vec<u32>> {
+    // This would need to be implemented based on the containerd runtime
+    // For now, return an error
+    Err(anyhow::anyhow!("Containerd support not yet implemented"))
+}
+
+/// Configure proxy redirection
+fn configure_proxy_redirection(ebpf: &mut Ebpf, proxy_addr: &str) -> Result<()> {
+    // Parse proxy address (IP:PORT)
+    let parts: Vec<&str> = proxy_addr.split(':').collect();
+    if parts.len() != 2 {
+        anyhow::bail!("Invalid proxy address format. Use IP:PORT (e.g., 127.0.0.1:8080)");
+    }
+
+    let ip_str = parts[0];
+    let port_str = parts[1];
+
+    // Parse IP address
+    let ip: Ipv4Addr = ip_str.parse()
+        .with_context(|| format!("Invalid IP address: {}", ip_str))?;
+
+    // Parse port
+    let port: u16 = port_str.parse()
+        .with_context(|| format!("Invalid port: {}", port_str))?;
+
+    // Create proxy configuration
+    let proxy_config = ProxyConfig {
+        proxy_addr: u32::from(ip),
+        proxy_port: port,
+        enabled: true,
+    };
+
+    // Get the PROXY_CONFIG map
+    let mut proxy_map: HashMap<_, u32, ProxyConfig> = HashMap::try_from(
+        ebpf.map_mut("PROXY_CONFIG")
+            .context("Failed to find PROXY_CONFIG map")?
+    ).context("Failed to create HashMap from PROXY_CONFIG")?;
+
+    // Store configuration at key 0
+    proxy_map.insert(&0u32, &proxy_config, 0)
+        .context("Failed to set proxy configuration")?;
+
+    info!("Configured proxy redirection to {}:{}", ip, port);
 
     Ok(())
 }

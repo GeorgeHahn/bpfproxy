@@ -1,23 +1,47 @@
+version: '3.8'
+
 services:
-  traffic-gen:
+  # Source: Client container that generates outgoing traffic
+  source-client:
     build:
       context: .
       dockerfile: Dockerfile.traffic-gen
-    container_name: bpf-traffic-gen
-    network_mode: bridge
+    container_name: source-client
     cap_add:
       - NET_ADMIN
     stdin_open: true
     tty: true
+    depends_on:
+      - target-server
+      - proxy-server
 
+  # Target: HTTP server that is the intended destination
   target-server:
     build:
       context: .
       dockerfile: Dockerfile.traffic-gen
-    container_name: bpf-target-server
-    network_mode: bridge
+    container_name: target-server
     cap_add:
       - NET_ADMIN
     stdin_open: true
     tty: true
     command: python3 /usr/local/bin/http_server.py
+    ports:
+      - "8080:8080"
+
+  # Proxy: Intercepts and forwards traffic transparently
+  proxy-server:
+    build:
+      context: .
+      dockerfile: Dockerfile.proxy
+    container_name: proxy-server
+    environment:
+      - PROXY_PORT=8888
+      - TARGET_HOST=target-server
+      - TARGET_PORT=8080
+    ports:
+      - "8888:8888"
+    stdin_open: true
+    tty: true
+    depends_on:
+      - target-server
