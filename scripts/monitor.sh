@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
-echo "=== BPF HTTP Traffic Monitor ==="
+echo "=== BPF Connection Monitor with Container Attribution ==="
 echo
 
 # Check if running as root
@@ -14,26 +14,41 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 # Parse command line arguments
-INTERFACE=""
+CGROUP_PATH="/sys/fs/cgroup"
 METRICS_INTERVAL=5
+SHOW_CONTAINERS=""
+SHOW_EVENTS=""
 
 while [[ $# -gt 0 ]]; do
     case $1 in
-        --interface|-i)
-            INTERFACE="$2"
+        --cgroup|-c)
+            CGROUP_PATH="$2"
             shift 2
             ;;
         --metrics-interval|-m)
             METRICS_INTERVAL="$2"
             shift 2
             ;;
+        --show-containers|-s)
+            SHOW_CONTAINERS="--show-containers"
+            shift
+            ;;
+        --show-events|-e)
+            SHOW_EVENTS="--show-events"
+            shift
+            ;;
         --help|-h)
             echo "Usage: sudo $0 [options]"
             echo
             echo "Options:"
-            echo "  -i, --interface <iface>      Interface to attach to (default: auto-detect)"
+            echo "  -c, --cgroup <path>          Cgroup path to attach to (default: /sys/fs/cgroup)"
             echo "  -m, --metrics-interval <sec> Metrics display interval (default: 5)"
+            echo "  -s, --show-containers        Show individual container metrics"
+            echo "  -e, --show-events            Show real-time connection events"
             echo "  -h, --help                   Show this help message"
+            echo
+            echo "This monitor hooks connection events (connect/accept/state changes)"
+            echo "instead of network interfaces, providing container attribution."
             exit 0
             ;;
         *)
@@ -43,109 +58,29 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Function to find the veth interface for a specific container
-find_container_veth() {
-    local container_name=$1
-
-    # Check if container exists and is running
-    if ! docker ps --format '{{.Names}}' | grep -q "^${container_name}$"; then
-        return 1
-    fi
-
-    # Get container's PID
-    local container_pid=$(docker inspect -f '{{.State.Pid}}' "$container_name" 2>/dev/null)
-    if [ -z "$container_pid" ]; then
-        return 1
-    fi
-
-    # Get the peer interface index from inside the container
-    local peer_index=$(nsenter -t "$container_pid" -n ip link show eth0 2>/dev/null | sed -n 's/.*@if\([0-9]*\):.*/\1/p')
-    if [ -z "$peer_index" ]; then
-        return 1
-    fi
-
-    # Find the veth interface on the host with this index
-    local veth_interface=$(ip link show | grep "^${peer_index}:" | cut -d: -f2 | cut -d@ -f1 | tr -d ' ')
-    if [ -n "$veth_interface" ]; then
-        echo "$veth_interface"
-        return 0
-    fi
-
-    return 1
-}
-
-# Auto-detect interface if not specified
-if [ -z "$INTERFACE" ]; then
-    echo "Detecting best interface for monitoring..."
-
-    # First, try to find the veth for bpf-target-server (where we want to see incoming traffic)
-    if command -v docker &>/dev/null; then
-        TARGET_VETH=$(find_container_veth "bpf-target-server")
-        if [ -n "$TARGET_VETH" ]; then
-            INTERFACE="$TARGET_VETH"
-            echo "Found bpf-target-server veth interface: $INTERFACE"
-        else
-            # Try traffic-gen container as backup
-            GEN_VETH=$(find_container_veth "bpf-traffic-gen")
-            if [ -n "$GEN_VETH" ]; then
-                INTERFACE="$GEN_VETH"
-                echo "Found bpf-traffic-gen veth interface: $INTERFACE"
-            fi
-        fi
-    fi
-
-    # If we couldn't find container veths, fall back to any veth
-    if [ -z "$INTERFACE" ]; then
-        INTERFACE=$(ip link show | grep -E 'veth.*master docker0' | head -1 | cut -d: -f2 | cut -d@ -f1 | tr -d ' ')
-        if [ -n "$INTERFACE" ]; then
-            echo "Using first available veth interface: $INTERFACE"
-        fi
-    fi
-
-    # If no veth, try docker0
-    if [ -z "$INTERFACE" ]; then
-        INTERFACE=$(ip link show | grep -o 'docker[0-9]*' | head -1)
-        if [ -n "$INTERFACE" ]; then
-            echo "Warning: Using docker0 bridge (may not see all traffic): $INTERFACE"
-        fi
-    fi
-
-    # If no docker, use default interface
-    if [ -z "$INTERFACE" ]; then
-        INTERFACE=$(ip route | grep default | awk '{print $5}' | head -1)
-        if [ -n "$INTERFACE" ]; then
-            echo "Using default network interface: $INTERFACE"
-        fi
-    fi
-
-    if [ -z "$INTERFACE" ]; then
-        echo "Error: Could not auto-detect network interface"
-        echo "Available interfaces:"
-        ip link show | grep -E '^[0-9]+:' | grep -v 'lo:' | awk '{print "  - " $2}' | sed 's/:$//'
-        exit 1
-    fi
-else
-    echo "Using specified interface: $INTERFACE"
-fi
-
-# Show which container this veth belongs to (if applicable)
-if echo "$INTERFACE" | grep -q "^veth"; then
-    echo
-    echo "Container interface mapping:"
-    for container in bpf-target-server bpf-traffic-gen; do
-        if docker ps --format '{{.Names}}' | grep -q "^${container}$"; then
-            CONTAINER_VETH=$(find_container_veth "$container")
-            if [ "$CONTAINER_VETH" = "$INTERFACE" ]; then
-                echo "  -> Monitoring traffic for container: $container"
-            fi
-        fi
-    done
-fi
-
-# Verify interface exists
-if ! ip link show "$INTERFACE" &>/dev/null; then
-    echo "Error: Interface $INTERFACE does not exist"
+# Verify cgroup v2 is mounted
+if [ ! -d "$CGROUP_PATH" ]; then
+    echo "Error: Cgroup path $CGROUP_PATH does not exist"
+    echo "Make sure cgroup v2 is mounted"
     exit 1
+fi
+
+# Check if it's cgroup v2
+if [ ! -f "$CGROUP_PATH/cgroup.controllers" ]; then
+    echo "Error: $CGROUP_PATH does not appear to be a cgroup v2 mount"
+    echo "This monitor requires cgroup v2 for connection hooks"
+    exit 1
+fi
+
+echo "Using cgroup path: $CGROUP_PATH"
+
+# Show container information if Docker is available
+if command -v docker &>/dev/null && docker ps -q &>/dev/null; then
+    echo
+    echo "Detected running containers:"
+    docker ps --format "table {{.ID}}\t{{.Names}}\t{{.Status}}" | head -10
+    echo
+    echo "Connection events from all containers and the host will be monitored."
 fi
 
 # Always rebuild to ensure latest changes
@@ -166,15 +101,30 @@ if [ ! -f "$EBPF_BINARY" ] || [ ! -f "$USERSPACE_BINARY" ]; then
 fi
 
 echo
-echo "Starting BPF monitor on $INTERFACE..."
+echo "Starting BPF connection monitor..."
 echo "Metrics interval: ${METRICS_INTERVAL}s"
+if [ -n "$SHOW_CONTAINERS" ]; then
+    echo "Container metrics: enabled"
+fi
+if [ -n "$SHOW_EVENTS" ]; then
+    echo "Real-time events: enabled (set RUST_LOG=debug to see events)"
+fi
 echo "Press Ctrl+C to stop"
 echo "----------------------------------------"
 echo
 
+# Set appropriate log level based on event display
+if [ -n "$SHOW_EVENTS" ]; then
+    LOG_LEVEL="debug"
+else
+    LOG_LEVEL="info"
+fi
+
 # Run the BPF program
 EBPF_PATH="$EBPF_BINARY" \
-RUST_LOG=info \
+RUST_LOG="$LOG_LEVEL" \
 exec "$USERSPACE_BINARY" \
-    --interface "$INTERFACE" \
-    --metrics-interval "$METRICS_INTERVAL"
+    --cgroup-path "$CGROUP_PATH" \
+    --metrics-interval "$METRICS_INTERVAL" \
+    $SHOW_CONTAINERS \
+    $SHOW_EVENTS

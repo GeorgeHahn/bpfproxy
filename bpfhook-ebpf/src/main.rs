@@ -1,483 +1,361 @@
-//! eBPF XDP program for HTTP traffic monitoring and metrics collection.
-//!
-//! This program attaches to a network interface and analyzes incoming packets
-//! to detect HTTP traffic, collecting metrics about request types and traffic volume.
-
 #![no_std]
 #![no_main]
 
 use aya_ebpf::{
-    bindings::xdp_action,
-    helpers::bpf_ktime_get_ns,
-    macros::{map, xdp},
-    maps::HashMap,
-    programs::XdpContext,
+    bindings::BPF_F_CURRENT_CPU,
+    helpers::{bpf_get_current_cgroup_id, bpf_get_current_pid_tgid, bpf_ktime_get_ns, bpf_probe_read_kernel},
+    macros::{cgroup_sock_addr, kprobe, map, tracepoint},
+    maps::{HashMap, LruHashMap, PerfEventArray},
+    programs::{SockAddrContext, ProbeContext, TracePointContext},
+    EbpfContext,
 };
-use aya_log_ebpf::info;
 
-// Constants for packet parsing
-const ETH_HEADER_LEN: usize = 14;
-const ETH_P_IP: u16 = 0x0800;
-const IP_PROTO_TCP: u8 = 6;
-const MIN_IP_HEADER_LEN: usize = 20;
-const MAX_IP_HEADER_LEN: usize = 60;
-const MIN_TCP_HEADER_LEN: usize = 20;
-const MAX_TCP_HEADER_LEN: usize = 60;
-
-// HTTP ports to monitor
-const HTTP_PORTS: [u16; 4] = [80, 8080, 8000, 3000];
-
-/// HTTP method types for categorization
-#[repr(u8)]
-#[derive(Clone, Copy, PartialEq)]
-pub enum HttpMethod {
-    Unknown = 0,
-    Get = 1,
-    Post = 2,
-    Put = 3,
-    Delete = 4,
-    Head = 5,
-    Patch = 6,
-    Trace = 7,
-    Options = 8,
-    Connect = 9,
-}
-
-impl HttpMethod {
-    /// Get a string representation for logging
-    #[inline(always)]
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            HttpMethod::Get => "GET",
-            HttpMethod::Post => "POST",
-            HttpMethod::Put => "PUT",
-            HttpMethod::Delete => "DELETE",
-            HttpMethod::Head => "HEAD",
-            HttpMethod::Patch => "PATCH",
-            HttpMethod::Trace => "TRACE",
-            HttpMethod::Options => "OPTIONS",
-            HttpMethod::Connect => "CONNECT",
-            HttpMethod::Unknown => "UNKNOWN",
-        }
-    }
-}
-
-/// HTTP metrics structure for tracking request statistics
+// Connection tracking structures
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub struct HttpMetrics {
-    pub total_requests: u64,
+pub struct ConnectionInfo {
+    pub pid: u32,
+    pub tid: u32,
+    pub cgroup_id: u64,
+    pub netns_cookie: u64,
+    pub src_addr: u32,
+    pub dst_addr: u32,
+    pub src_port: u16,
+    pub dst_port: u16,
+    pub protocol: u8,
+    pub state: u8,
+    pub timestamp: u64,
+    pub is_container: bool,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ConnectionMetrics {
+    pub total_connections: u64,
+    pub active_connections: u64,
+    pub bytes_sent: u64,
+    pub bytes_received: u64,
+    pub http_requests: u64,
     pub get_requests: u64,
     pub post_requests: u64,
     pub put_requests: u64,
     pub delete_requests: u64,
     pub other_requests: u64,
-    pub bytes_processed: u64,
     pub last_updated: u64,
 }
 
-/// Map to store HTTP metrics by port
+// Socket state values from Linux kernel
+const TCP_ESTABLISHED: u8 = 1;
+const TCP_SYN_SENT: u8 = 2;
+const TCP_SYN_RECV: u8 = 3;
+const TCP_FIN_WAIT1: u8 = 4;
+const TCP_FIN_WAIT2: u8 = 5;
+const TCP_TIME_WAIT: u8 = 6;
+const TCP_CLOSE: u8 = 7;
+const TCP_CLOSE_WAIT: u8 = 8;
+const TCP_LAST_ACK: u8 = 9;
+const TCP_LISTEN: u8 = 10;
+const TCP_CLOSING: u8 = 11;
+
+// Address families
+const AF_INET: u16 = 2;
+const AF_INET6: u16 = 10;
+
+// Maps for tracking connections and metrics
 #[map]
-static mut HTTP_METRICS: HashMap<u16, HttpMetrics> = HashMap::with_max_entries(1024, 0);
+static mut CONNECTION_MAP: LruHashMap<u64, ConnectionInfo> = LruHashMap::with_max_entries(10000, 0);
 
-/// Map to store per-IP request counts
 #[map]
-static mut IP_REQUEST_COUNT: HashMap<u32, u64> = HashMap::with_max_entries(10000, 0);
+static mut METRICS_BY_CGROUP: HashMap<u64, ConnectionMetrics> = HashMap::with_max_entries(1024, 0);
 
-/// XDP entry point for packet processing
-#[xdp]
-pub fn bpfhook(ctx: XdpContext) -> u32 {
-    match process_packet(ctx) {
-        Ok(action) => action,
-        Err(_) => xdp_action::XDP_PASS, // Pass packet on error to avoid dropping traffic
-    }
-}
+#[map]
+static mut METRICS_BY_NETNS: HashMap<u64, ConnectionMetrics> = HashMap::with_max_entries(1024, 0);
 
-/// Main packet processing logic
-fn process_packet(ctx: XdpContext) -> Result<u32, ()> {
-    let packet_info = parse_packet(&ctx)?;
+#[map]
+static mut CONNECTION_EVENTS: PerfEventArray<ConnectionInfo> = PerfEventArray::new(0);
 
-    // Only process HTTP traffic on configured ports
-    if !is_http_port(packet_info.dst_port) {
-        return Ok(xdp_action::XDP_PASS);
-    }
-
-    // Check if payload contains HTTP request
-    if let Some(method) = detect_http_method(packet_info.payload, packet_info.payload_end) {
-        // Update metrics for this HTTP request
-        update_metrics(packet_info.dst_port, method, packet_info.payload_size)?;
-        update_ip_counter(packet_info.src_ip)?;
-
-        info!(&ctx, "HTTP {} request on port {} from IP {:x}",
-              method.as_str(), packet_info.dst_port, packet_info.src_ip);
-    }
-
-    Ok(xdp_action::XDP_PASS)
-}
-
-/// Packet information extracted from raw data
-struct PacketInfo {
-    src_ip: u32,
-    dst_port: u16,
-    payload: *const u8,
-    payload_end: *const u8,
-    payload_size: u64,
-}
-
-/// Parse packet headers and extract relevant information
-fn parse_packet(ctx: &XdpContext) -> Result<PacketInfo, ()> {
-    let data = ctx.data() as *const u8;
-    let data_end = ctx.data_end() as *const u8;
-
-    unsafe {
-        // Validate Ethernet header
-        if !has_enough_data(data, data_end, ETH_HEADER_LEN) {
-            return Err(());
-        }
-
-        // Check for IPv4
-        let eth_proto = read_u16_be(data.add(12))?;
-        if eth_proto != ETH_P_IP {
-            return Err(());
-        }
-
-        // Parse IP header
-        let ip_header = data.add(ETH_HEADER_LEN);
-        if !has_enough_data(ip_header, data_end, MIN_IP_HEADER_LEN) {
-            return Err(());
-        }
-
-        let ip_header_len = get_ip_header_len(ip_header)?;
-        if !is_valid_header_len(ip_header_len, MIN_IP_HEADER_LEN, MAX_IP_HEADER_LEN) {
-            return Err(());
-        }
-
-        // Check for TCP protocol
-        let protocol = *ip_header.add(9);
-        if protocol != IP_PROTO_TCP {
-            return Err(());
-        }
-
-        // Extract source IP
-        let src_ip = read_u32_be(ip_header.add(12))?;
-
-        // Parse TCP header
-        let tcp_start = ETH_HEADER_LEN + ip_header_len;
-        let tcp_header = data.add(tcp_start);
-        if !has_enough_data(tcp_header, data_end, MIN_TCP_HEADER_LEN) {
-            return Err(());
-        }
-
-        let tcp_header_len = get_tcp_header_len(tcp_header)?;
-        if !is_valid_header_len(tcp_header_len, MIN_TCP_HEADER_LEN, MAX_TCP_HEADER_LEN) {
-            return Err(());
-        }
-
-        // Extract destination port
-        let dst_port = read_u16_be(tcp_header.add(2))?;
-
-        // Calculate payload information
-        let payload_start = tcp_start + tcp_header_len;
-        let payload = data.add(payload_start);
-
-        if payload >= data_end {
-            return Err(());
-        }
-
-        let payload_size = (data_end as usize - payload as usize) as u64;
-
-        Ok(PacketInfo {
-            src_ip,
-            dst_port,
-            payload,
-            payload_end: data_end,
-            payload_size,
-        })
-    }
-}
-
-/// Helper function to check if we have enough data
+// Generate unique connection ID from 4-tuple
 #[inline(always)]
-fn has_enough_data(ptr: *const u8, end: *const u8, size: usize) -> bool {
-    unsafe { ptr.add(size) <= end }
+fn gen_conn_id(src_addr: u32, dst_addr: u32, src_port: u16, dst_port: u16) -> u64 {
+    ((src_addr as u64) << 32) | ((dst_addr as u64) << 16) | ((src_port as u64) << 8) | (dst_port as u64)
 }
 
-/// Helper function to validate header length
+// Check if this is a container based on cgroup path or namespace
 #[inline(always)]
-fn is_valid_header_len(len: usize, min: usize, max: usize) -> bool {
-    len >= min && len <= max
+fn is_container_connection(cgroup_id: u64, netns_cookie: u64) -> bool {
+    // Simple heuristic: non-root cgroup or non-default netns indicates container
+    // In production, you'd want more sophisticated checks
+    cgroup_id != 1 || netns_cookie != 0
 }
 
-/// Check if port is an HTTP port we're monitoring
-#[inline(always)]
-fn is_http_port(port: u16) -> bool {
-    HTTP_PORTS.contains(&port)
-}
 
-/// Read a big-endian u16 from a pointer
-#[inline(always)]
-unsafe fn read_u16_be(ptr: *const u8) -> Result<u16, ()> {
-    Ok(u16::from_be_bytes([*ptr, *ptr.add(1)]))
-}
-
-/// Read a big-endian u32 from a pointer
-#[inline(always)]
-unsafe fn read_u32_be(ptr: *const u8) -> Result<u32, ()> {
-    Ok(u32::from_be_bytes([
-        *ptr,
-        *ptr.add(1),
-        *ptr.add(2),
-        *ptr.add(3),
-    ]))
-}
-
-/// Get IP header length from the version/IHL field
-#[inline(always)]
-unsafe fn get_ip_header_len(ip_header: *const u8) -> Result<usize, ()> {
-    Ok(((*ip_header & 0x0F) * 4) as usize)
-}
-
-/// Get TCP header length from the data offset field
-#[inline(always)]
-unsafe fn get_tcp_header_len(tcp_header: *const u8) -> Result<usize, ()> {
-    Ok(((*tcp_header.add(12) >> 4) * 4) as usize)
-}
-
-/// Detect if payload contains an HTTP method and return the method type
-///
-/// Optimized for common methods (GET, POST) while maintaining correctness
-/// for all HTTP methods.
-fn detect_http_method(payload: *const u8, data_end: *const u8) -> Option<HttpMethod> {
-    unsafe {
-        // Need at least 3 bytes for shortest method (GET)
-        if payload.add(3) > data_end {
-            return None;
-        }
-
-        // Read first byte to quickly filter non-HTTP traffic
-        let b0 = *payload;
-
-        // Use first byte to branch early - most HTTP methods start with G, P, H, D, T, C, or O
-        match b0 {
-            b'G' => check_get_method(payload, data_end),
-            b'P' => check_p_methods(payload, data_end), // POST, PUT, PATCH
-            b'H' => check_head_method(payload, data_end),
-            b'D' => check_delete_method(payload, data_end),
-            b'T' => check_trace_method(payload, data_end),
-            b'C' => check_connect_method(payload, data_end),
-            b'O' => check_options_method(payload, data_end),
-            _ => None,
-        }
+// Hook for outbound IPv4 connections (cgroup/connect4)
+#[cgroup_sock_addr(connect4)]
+pub fn bpfhook_connect4(ctx: SockAddrContext) -> i32 {
+    match try_bpfhook_connect4(ctx) {
+        Ok(ret) => ret,
+        Err(_) => 1,
     }
 }
 
-/// Check for GET method (most common)
-#[inline(always)]
-unsafe fn check_get_method(payload: *const u8, data_end: *const u8) -> Option<HttpMethod> {
-    if payload.add(4) <= data_end &&
-       *payload.add(1) == b'E' &&
-       *payload.add(2) == b'T' &&
-       *payload.add(3) == b' ' {
-        Some(HttpMethod::Get)
-    } else {
-        None
-    }
-}
+fn try_bpfhook_connect4(ctx: SockAddrContext) -> Result<i32, i64> {
+    let sock_addr = unsafe { &*ctx.sock_addr };
 
-/// Check for methods starting with 'P' (POST, PUT, PATCH)
-#[inline(always)]
-unsafe fn check_p_methods(payload: *const u8, data_end: *const u8) -> Option<HttpMethod> {
-    if payload.add(3) > data_end {
-        return None;
+    // Only handle IPv4
+    if sock_addr.family != (AF_INET as u32) {
+        return Ok(1);
     }
 
-    let b1 = *payload.add(1);
-    let b2 = *payload.add(2);
+    // Get connection info
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let pid = (pid_tgid >> 32) as u32;
+    let tid = pid_tgid as u32;
+    let cgroup_id = unsafe { bpf_get_current_cgroup_id() };
 
-    // Check PUT (3 letters + space)
-    if b1 == b'U' && b2 == b'T' {
-        if payload.add(4) <= data_end && *payload.add(3) == b' ' {
-            return Some(HttpMethod::Put);
-        }
-    }
-    // Check POST (4 letters, may have space or /)
-    else if b1 == b'O' && b2 == b'S' {
-        if payload.add(4) <= data_end && *payload.add(3) == b'T' {
-            if payload.add(5) <= data_end {
-                let b4 = *payload.add(4);
-                if b4 == b' ' || b4 == b'/' {
-                    return Some(HttpMethod::Post);
-                }
-            }
-        }
-    }
-    // Check PATCH (5 letters)
-    else if b1 == b'A' && b2 == b'T' {
-        if payload.add(6) <= data_end &&
-           *payload.add(3) == b'C' &&
-           *payload.add(4) == b'H' &&
-           *payload.add(5) == b' ' {
-            return Some(HttpMethod::Patch);
-        }
-    }
+    // For cgroup/connect hooks, we don't have direct socket access
+    // So we'll set netns_cookie to 0 and rely on cgroup_id for container attribution
+    let netns_cookie = 0u64;
 
-    None
-}
+    // Read destination address from context
+    let dst_addr = u32::from_be(sock_addr.user_ip4);
+    let dst_port = u16::from_be(sock_addr.user_port as u16);
 
-/// Check for HEAD method
-#[inline(always)]
-unsafe fn check_head_method(payload: *const u8, data_end: *const u8) -> Option<HttpMethod> {
-    if payload.add(5) <= data_end &&
-       *payload.add(1) == b'E' &&
-       *payload.add(2) == b'A' &&
-       *payload.add(3) == b'D' &&
-       *payload.add(4) == b' ' {
-        Some(HttpMethod::Head)
-    } else {
-        None
-    }
-}
-
-/// Check for DELETE method
-#[inline(always)]
-unsafe fn check_delete_method(payload: *const u8, data_end: *const u8) -> Option<HttpMethod> {
-    if payload.add(7) <= data_end &&
-       *payload.add(1) == b'E' &&
-       *payload.add(2) == b'L' &&
-       *payload.add(3) == b'E' &&
-       *payload.add(4) == b'T' &&
-       *payload.add(5) == b'E' &&
-       *payload.add(6) == b' ' {
-        Some(HttpMethod::Delete)
-    } else {
-        None
-    }
-}
-
-/// Check for TRACE method
-#[inline(always)]
-unsafe fn check_trace_method(payload: *const u8, data_end: *const u8) -> Option<HttpMethod> {
-    if payload.add(6) <= data_end &&
-       *payload.add(1) == b'R' &&
-       *payload.add(2) == b'A' &&
-       *payload.add(3) == b'C' &&
-       *payload.add(4) == b'E' &&
-       *payload.add(5) == b' ' {
-        Some(HttpMethod::Trace)
-    } else {
-        None
-    }
-}
-
-/// Check for CONNECT method
-#[inline(always)]
-unsafe fn check_connect_method(payload: *const u8, data_end: *const u8) -> Option<HttpMethod> {
-    if payload.add(8) <= data_end &&
-       *payload.add(1) == b'O' &&
-       *payload.add(2) == b'N' &&
-       *payload.add(3) == b'N' &&
-       *payload.add(4) == b'E' &&
-       *payload.add(5) == b'C' &&
-       *payload.add(6) == b'T' &&
-       *payload.add(7) == b' ' {
-        Some(HttpMethod::Connect)
-    } else {
-        None
-    }
-}
-
-/// Check for OPTIONS method
-#[inline(always)]
-unsafe fn check_options_method(payload: *const u8, data_end: *const u8) -> Option<HttpMethod> {
-    if payload.add(8) <= data_end &&
-       *payload.add(1) == b'P' &&
-       *payload.add(2) == b'T' &&
-       *payload.add(3) == b'I' &&
-       *payload.add(4) == b'O' &&
-       *payload.add(5) == b'N' &&
-       *payload.add(6) == b'S' &&
-       *payload.add(7) == b' ' {
-        Some(HttpMethod::Options)
-    } else {
-        None
-    }
-}
-
-/// Update HTTP metrics for a given port and method
-fn update_metrics(port: u16, method: HttpMethod, payload_size: u64) -> Result<(), ()> {
-    unsafe {
-        let timestamp = bpf_ktime_get_ns();
-        let map = &mut *core::ptr::addr_of_mut!(HTTP_METRICS);
-
-        // Try to get existing metrics for this port
-        let metrics_ptr = map.get_ptr_mut(&port).ok_or(())?;
-
-        if metrics_ptr.is_null() {
-            // Create new metrics entry
-            let new_metrics = create_initial_metrics(method, payload_size, timestamp);
-            map.insert(&port, &new_metrics, 0).map_err(|_| ())?;
-        } else {
-            // Update existing metrics
-            let metrics = &mut *metrics_ptr;
-            metrics.total_requests += 1;
-            metrics.bytes_processed += payload_size;
-            metrics.last_updated = timestamp;
-
-            // Increment the appropriate method counter
-            increment_method_counter(metrics, method);
-        }
-    }
-    Ok(())
-}
-
-/// Create initial metrics for a new port
-#[inline(always)]
-fn create_initial_metrics(method: HttpMethod, payload_size: u64, timestamp: u64) -> HttpMetrics {
-    let mut metrics = HttpMetrics {
-        total_requests: 1,
-        get_requests: 0,
-        post_requests: 0,
-        put_requests: 0,
-        delete_requests: 0,
-        other_requests: 0,
-        bytes_processed: payload_size,
-        last_updated: timestamp,
+    // For connect, source port is usually assigned by kernel, we'll track in state change
+    let conn_info = ConnectionInfo {
+        pid,
+        tid,
+        cgroup_id,
+        netns_cookie,
+        src_addr: 0, // Will be filled during state change
+        dst_addr,
+        src_port: 0, // Will be filled during state change
+        dst_port,
+        protocol: 6, // TCP
+        state: TCP_SYN_SENT,
+        timestamp: unsafe { bpf_ktime_get_ns() },
+        is_container: is_container_connection(cgroup_id, netns_cookie),
     };
 
-    increment_method_counter(&mut metrics, method);
-    metrics
-}
-
-/// Increment the appropriate method counter in metrics
-#[inline(always)]
-fn increment_method_counter(metrics: &mut HttpMetrics, method: HttpMethod) {
-    match method {
-        HttpMethod::Get => metrics.get_requests += 1,
-        HttpMethod::Post => metrics.post_requests += 1,
-        HttpMethod::Put => metrics.put_requests += 1,
-        HttpMethod::Delete => metrics.delete_requests += 1,
-        HttpMethod::Head | HttpMethod::Patch | HttpMethod::Trace |
-        HttpMethod::Options | HttpMethod::Connect | HttpMethod::Unknown => {
-            metrics.other_requests += 1
-        }
-    }
-}
-
-/// Update the per-IP request counter
-fn update_ip_counter(ip: u32) -> Result<(), ()> {
+    // Store connection info
+    let conn_id = gen_conn_id(0, dst_addr, 0, dst_port);
     unsafe {
-        let map = &mut *core::ptr::addr_of_mut!(IP_REQUEST_COUNT);
-        let count_ptr = map.get_ptr_mut(&ip).ok_or(())?;
+        CONNECTION_MAP.insert(&conn_id, &conn_info, 0)?;
+    }
 
-        if count_ptr.is_null() {
-            // Insert new IP with count of 1
-            map.insert(&ip, &1u64, 0).map_err(|_| ())?;
-        } else {
-            // Increment existing count
-            *count_ptr += 1;
+    // Send event to userspace
+    unsafe {
+        CONNECTION_EVENTS.output(&ctx, &conn_info, BPF_F_CURRENT_CPU as u32);
+    }
+
+    // Update metrics
+    update_metrics(cgroup_id, netns_cookie, true, false);
+
+    Ok(1)
+}
+
+// Hook for outbound IPv6 connections (cgroup/connect6)
+#[cgroup_sock_addr(connect6)]
+pub fn bpfhook_connect6(_ctx: SockAddrContext) -> i32 {
+    // For now, we'll focus on IPv4. IPv6 can be added similarly
+    1
+}
+
+// Tracepoint for socket state changes
+#[tracepoint]
+pub fn bpfhook_sock_state(ctx: TracePointContext) -> u32 {
+    match try_bpfhook_sock_state(ctx) {
+        Ok(ret) => ret,
+        Err(_) => 0,
+    }
+}
+
+fn try_bpfhook_sock_state(ctx: TracePointContext) -> Result<u32, i64> {
+    // The tracepoint args structure for sock:inet_sock_set_state
+    // Contains: oldstate, newstate, sport, dport, family, protocol, saddr[], daddr[]
+
+    // Read the new state (offset 8 bytes from start of args)
+    let newstate: i32 = unsafe {
+        let ptr = ctx.as_ptr().add(8) as *const i32;
+        bpf_probe_read_kernel(ptr).unwrap_or(0)
+    };
+
+    // Read source and dest ports (offsets 16 and 18)
+    let sport: u16 = unsafe {
+        let sport_ptr = ctx.as_ptr().add(16) as *const u16;
+        bpf_probe_read_kernel(sport_ptr).unwrap_or(0)
+    };
+    let dport: u16 = unsafe {
+        let dport_ptr = ctx.as_ptr().add(18) as *const u16;
+        bpf_probe_read_kernel(dport_ptr).unwrap_or(0)
+    };
+
+    // Read family (offset 20)
+    let family: u16 = unsafe {
+        let family_ptr = ctx.as_ptr().add(20) as *const u16;
+        bpf_probe_read_kernel(family_ptr).unwrap_or(0)
+    };
+
+    // Only handle IPv4 TCP
+    if family != AF_INET {
+        return Ok(0);
+    }
+
+    // Read source and dest addresses for IPv4 (offsets 24 and 40)
+    let saddr: u32 = unsafe {
+        let saddr_ptr = ctx.as_ptr().add(24) as *const u32;
+        bpf_probe_read_kernel(saddr_ptr).unwrap_or(0)
+    };
+    let daddr: u32 = unsafe {
+        let daddr_ptr = ctx.as_ptr().add(40) as *const u32;
+        bpf_probe_read_kernel(daddr_ptr).unwrap_or(0)
+    };
+
+    // Get process and container info
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let pid = (pid_tgid >> 32) as u32;
+    let tid = pid_tgid as u32;
+    let cgroup_id = unsafe { bpf_get_current_cgroup_id() };
+    let netns_cookie = 0; // Would need socket pointer to get this
+
+    let conn_info = ConnectionInfo {
+        pid,
+        tid,
+        cgroup_id,
+        netns_cookie,
+        src_addr: saddr,
+        dst_addr: daddr,
+        src_port: sport,
+        dst_port: dport,
+        protocol: 6, // TCP
+        state: newstate as u8,
+        timestamp: unsafe { bpf_ktime_get_ns() },
+        is_container: is_container_connection(cgroup_id, netns_cookie),
+    };
+
+    // Store/update connection info
+    let conn_id = gen_conn_id(saddr, daddr, sport, dport);
+    unsafe {
+        CONNECTION_MAP.insert(&conn_id, &conn_info, 0)?;
+    }
+
+    // Send state change event to userspace
+    unsafe {
+        CONNECTION_EVENTS.output(&ctx, &conn_info, BPF_F_CURRENT_CPU as u32);
+    }
+
+    // Track metrics for established and closed connections
+    if newstate == TCP_ESTABLISHED as i32 {
+        update_metrics(cgroup_id, netns_cookie, false, true);
+    } else if newstate == TCP_CLOSE as i32 {
+        update_metrics(cgroup_id, netns_cookie, false, false);
+    }
+
+    Ok(0)
+}
+
+// Kprobe for inbound connections (inet_csk_accept)
+#[kprobe]
+pub fn bpfhook_accept(ctx: ProbeContext) -> u32 {
+    match try_bpfhook_accept(ctx) {
+        Ok(ret) => ret,
+        Err(_) => 0,
+    }
+}
+
+fn try_bpfhook_accept(ctx: ProbeContext) -> Result<u32, i64> {
+    // Get process and container info
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let pid = (pid_tgid >> 32) as u32;
+    let tid = pid_tgid as u32;
+    let cgroup_id = unsafe { bpf_get_current_cgroup_id() };
+
+    // For accept, we track that this process accepted a connection
+    // The actual connection details will come from state changes
+    let conn_info = ConnectionInfo {
+        pid,
+        tid,
+        cgroup_id,
+        netns_cookie: 0,
+        src_addr: 0,
+        dst_addr: 0,
+        src_port: 0,
+        dst_port: 0,
+        protocol: 6, // TCP
+        state: TCP_ESTABLISHED,
+        timestamp: unsafe { bpf_ktime_get_ns() },
+        is_container: is_container_connection(cgroup_id, 0),
+    };
+
+    // Send accept event to userspace
+    unsafe {
+        CONNECTION_EVENTS.output(&ctx, &conn_info, BPF_F_CURRENT_CPU as u32);
+    }
+
+    // Update metrics for inbound connection
+    update_metrics(cgroup_id, 0, false, true);
+
+    Ok(0)
+}
+
+// Helper function to update metrics
+fn update_metrics(cgroup_id: u64, netns_cookie: u64, is_connect: bool, is_established: bool) {
+    let timestamp = unsafe { bpf_ktime_get_ns() };
+
+    // Update cgroup-based metrics
+    unsafe {
+        let mut metrics = METRICS_BY_CGROUP.get(&cgroup_id).copied().unwrap_or(ConnectionMetrics {
+            total_connections: 0,
+            active_connections: 0,
+            bytes_sent: 0,
+            bytes_received: 0,
+            http_requests: 0,
+            get_requests: 0,
+            post_requests: 0,
+            put_requests: 0,
+            delete_requests: 0,
+            other_requests: 0,
+            last_updated: 0,
+        });
+
+        if is_connect {
+            metrics.total_connections += 1;
+        }
+        if is_established {
+            metrics.active_connections += 1;
+        }
+        metrics.last_updated = timestamp;
+
+        let _ = METRICS_BY_CGROUP.insert(&cgroup_id, &metrics, 0);
+    }
+
+    // Update netns-based metrics if available
+    if netns_cookie != 0 {
+        unsafe {
+            let mut metrics = METRICS_BY_NETNS.get(&netns_cookie).copied().unwrap_or(ConnectionMetrics {
+                total_connections: 0,
+                active_connections: 0,
+                bytes_sent: 0,
+                bytes_received: 0,
+                http_requests: 0,
+                get_requests: 0,
+                post_requests: 0,
+                put_requests: 0,
+                delete_requests: 0,
+                other_requests: 0,
+                last_updated: 0,
+            });
+
+            if is_connect {
+                metrics.total_connections += 1;
+            }
+            if is_established {
+                metrics.active_connections += 1;
+            }
+            metrics.last_updated = timestamp;
+
+            let _ = METRICS_BY_NETNS.insert(&netns_cookie, &metrics, 0);
         }
     }
-    Ok(())
 }
 
 #[panic_handler]

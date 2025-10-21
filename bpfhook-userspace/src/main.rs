@@ -1,60 +1,108 @@
-//! Userspace component for HTTP traffic monitoring with eBPF
+//! Userspace component for connection monitoring with eBPF
 //!
-//! This program loads an eBPF XDP program to monitor HTTP traffic,
-//! collecting and displaying metrics about request types and volume.
+//! This program loads eBPF programs that hook connection events (connect/accept/state changes)
+//! to monitor network traffic with container attribution.
 
 use anyhow::{Context, Result};
 use aya::{
-    maps::{HashMap, MapData},
-    programs::{Xdp, XdpFlags},
+    maps::{HashMap, MapData, AsyncPerfEventArray},
+    programs::{CgroupSockAddr, CgroupAttachMode, KProbe, TracePoint},
+    util::online_cpus,
     Ebpf, Pod,
 };
 use aya_log::EbpfLogger;
+use bytes::BytesMut;
 use clap::Parser;
-use log::{info, warn};
+use log::{info, warn, debug, trace};
 use std::{
+    collections::BTreeMap,
+    convert::TryFrom,
     net::Ipv4Addr,
     path::{Path, PathBuf},
     time::Duration,
 };
-use tokio::{signal, time};
+use tokio::{signal, time, task};
 
+// Connection info structure matching the eBPF side
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
-pub struct HttpMetrics {
-    pub total_requests: u64,
+pub struct ConnectionInfo {
+    pub pid: u32,
+    pub tid: u32,
+    pub cgroup_id: u64,
+    pub netns_cookie: u64,
+    pub src_addr: u32,
+    pub dst_addr: u32,
+    pub src_port: u16,
+    pub dst_port: u16,
+    pub protocol: u8,
+    pub state: u8,
+    pub timestamp: u64,
+    pub is_container: bool,
+}
+
+// SAFETY: ConnectionInfo is a plain C struct, safe for Pod
+unsafe impl Pod for ConnectionInfo {}
+
+// Connection metrics structure matching the eBPF side
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+pub struct ConnectionMetrics {
+    pub total_connections: u64,
+    pub active_connections: u64,
+    pub bytes_sent: u64,
+    pub bytes_received: u64,
+    pub http_requests: u64,
     pub get_requests: u64,
     pub post_requests: u64,
     pub put_requests: u64,
     pub delete_requests: u64,
     pub other_requests: u64,
-    pub bytes_processed: u64,
     pub last_updated: u64,
 }
 
-// SAFETY: HttpMetrics is a plain C struct with only u64 fields,
-// making it safe to treat as Plain Old Data
-unsafe impl Pod for HttpMetrics {}
+// SAFETY: ConnectionMetrics is a plain C struct, safe for Pod
+unsafe impl Pod for ConnectionMetrics {}
+
+// TCP state names for display
+const TCP_STATES: &[&str] = &[
+    "UNKNOWN",
+    "ESTABLISHED",
+    "SYN_SENT",
+    "SYN_RECV",
+    "FIN_WAIT1",
+    "FIN_WAIT2",
+    "TIME_WAIT",
+    "CLOSE",
+    "CLOSE_WAIT",
+    "LAST_ACK",
+    "LISTEN",
+    "CLOSING",
+];
 
 #[derive(Parser, Debug)]
 #[clap(
     name = "bpfhook",
-    about = "HTTP traffic monitor using eBPF",
+    about = "Connection monitor using eBPF with container attribution",
     version,
     author
 )]
 struct Args {
-    /// Network interface to attach to
-    #[clap(short, long, default_value = "lo")]
-    interface: String,
+    /// Cgroup path to attach connect hooks (default: root cgroup v2)
+    #[clap(short = 'c', long, default_value = "/sys/fs/cgroup")]
+    cgroup_path: String,
 
     /// Interval in seconds to print metrics
     #[clap(short = 'm', long, default_value = "5")]
     metrics_interval: u64,
 
-    /// Show top N IP addresses by request count
-    #[clap(short = 't', long, default_value = "10")]
-    top_ips: usize,
+    /// Show container metrics separately
+    #[clap(short = 's', long)]
+    show_containers: bool,
+
+    /// Show real-time connection events
+    #[clap(short = 'e', long)]
+    show_events: bool,
 
     /// Path to the eBPF program binary (can also set via EBPF_PATH env var)
     #[clap(short = 'p', long)]
@@ -79,35 +127,40 @@ async fn main() -> Result<()> {
         warn!("Failed to initialize eBPF logger: {}", e);
     }
 
-    // Load and attach the XDP program
-    let program = load_xdp_program(&mut ebpf)?;
-    attach_xdp_to_interface(program, &args.interface)?;
+    // Load and attach all the eBPF programs
+    attach_all_programs(&mut ebpf, &args.cgroup_path)?;
 
-    info!(
-        "XDP program attached successfully to {}. Metrics interval: {} seconds.",
-        args.interface, args.metrics_interval
-    );
-    info!("Monitoring HTTP traffic on ports: 80, 8080, 8000, 3000");
+    info!("eBPF programs attached successfully.");
+    info!("Monitoring connections with container attribution.");
     info!("Press Ctrl-C to exit.\n");
 
-    // Get references to the BPF maps
-    let http_metrics_map = get_http_metrics_map(&ebpf)?;
-    let ip_request_count_map = get_ip_request_map(&ebpf)?;
-
-    // Create metrics display configuration
-    let display_config = MetricsDisplayConfig {
-        top_ips: args.top_ips,
+    // Start event processing if requested (do this before getting maps to avoid borrow conflict)
+    let event_handle = if args.show_events {
+        Some(spawn_event_processor(&mut ebpf)?)
+    } else {
+        None
     };
+
+    // Get references to the BPF maps (after mutable borrow is done)
+    let connection_map = get_connection_map(&ebpf)?;
+    let cgroup_metrics_map = get_cgroup_metrics_map(&ebpf)?;
+    let netns_metrics_map = get_netns_metrics_map(&ebpf)?;
 
     // Run the monitoring loop
     run_monitoring_loop(
-        http_metrics_map,
-        ip_request_count_map,
+        connection_map,
+        cgroup_metrics_map,
+        netns_metrics_map,
         args.metrics_interval,
-        display_config,
+        args.show_containers,
     ).await?;
 
-    info!("Detaching XDP program...");
+    // Clean up event processor
+    if let Some(handle) = event_handle {
+        handle.abort();
+    }
+
+    info!("Detaching eBPF programs...");
     Ok(())
 }
 
@@ -149,56 +202,203 @@ fn load_ebpf_program(path: &Path) -> Result<Ebpf> {
         .with_context(|| format!("Failed to load eBPF program from {}", path.display()))
 }
 
-/// Load the XDP program from the eBPF object
-fn load_xdp_program(ebpf: &mut Ebpf) -> Result<&mut Xdp> {
-    let program: &mut Xdp = ebpf
-        .program_mut("bpfhook")
-        .context("Failed to find 'bpfhook' XDP program")?
-        .try_into()
-        .context("Failed to convert program to XDP type")?;
+/// Attach all eBPF programs to their respective hooks
+fn attach_all_programs(ebpf: &mut Ebpf, cgroup_path: &str) -> Result<()> {
+    // Attach cgroup/connect4 hook
+    attach_cgroup_connect4(ebpf, cgroup_path)?;
 
-    program.load()
-        .context("Failed to load XDP program into kernel")?;
+    // Attach cgroup/connect6 hook (for IPv6 support)
+    attach_cgroup_connect6(ebpf, cgroup_path)?;
 
-    Ok(program)
-}
+    // Attach tracepoint for socket state changes
+    attach_sock_state_tracepoint(ebpf)?;
 
-/// Attach the XDP program to the network interface
-fn attach_xdp_to_interface(program: &mut Xdp, interface: &str) -> Result<()> {
-    info!("Attaching XDP program to interface: {}", interface);
-    program
-        .attach(interface, XdpFlags::default())
-        .with_context(|| format!("Failed to attach XDP program to interface '{}'", interface))?;
+    // Attach kprobe for accept
+    attach_accept_kprobe(ebpf)?;
+
     Ok(())
 }
 
-/// Get the HTTP metrics map
-fn get_http_metrics_map(ebpf: &Ebpf) -> Result<HashMap<&MapData, u16, HttpMetrics>> {
-    HashMap::try_from(
-        ebpf.map("HTTP_METRICS")
-            .context("Failed to find HTTP_METRICS map")?
-    ).context("Failed to create HashMap from HTTP_METRICS")
+/// Attach the cgroup/connect4 program
+fn attach_cgroup_connect4(ebpf: &mut Ebpf, cgroup_path: &str) -> Result<()> {
+    let program: &mut CgroupSockAddr = ebpf
+        .program_mut("bpfhook_connect4")
+        .context("Failed to find 'bpfhook_connect4' program")?
+        .try_into()
+        .context("Failed to convert to CgroupSockAddr program")?;
+
+    let cgroup = std::fs::File::open(cgroup_path)
+        .with_context(|| format!("Failed to open cgroup path: {}", cgroup_path))?;
+
+    program.load()
+        .context("Failed to load cgroup/connect4 program")?;
+
+    program.attach(cgroup, CgroupAttachMode::Single)
+        .context("Failed to attach cgroup/connect4 program")?;
+
+    info!("Attached cgroup/connect4 hook");
+    Ok(())
 }
 
-/// Get the IP request count map
-fn get_ip_request_map(ebpf: &Ebpf) -> Result<HashMap<&MapData, u32, u64>> {
-    HashMap::try_from(
-        ebpf.map("IP_REQUEST_COUNT")
-            .context("Failed to find IP_REQUEST_COUNT map")?
-    ).context("Failed to create HashMap from IP_REQUEST_COUNT")
+/// Attach the cgroup/connect6 program
+fn attach_cgroup_connect6(ebpf: &mut Ebpf, cgroup_path: &str) -> Result<()> {
+    let program: &mut CgroupSockAddr = ebpf
+        .program_mut("bpfhook_connect6")
+        .context("Failed to find 'bpfhook_connect6' program")?
+        .try_into()
+        .context("Failed to convert to CgroupSockAddr program")?;
+
+    let cgroup = std::fs::File::open(cgroup_path)
+        .with_context(|| format!("Failed to open cgroup path: {}", cgroup_path))?;
+
+    program.load()
+        .context("Failed to load cgroup/connect6 program")?;
+
+    program.attach(cgroup, CgroupAttachMode::Single)
+        .context("Failed to attach cgroup/connect6 program")?;
+
+    info!("Attached cgroup/connect6 hook");
+    Ok(())
 }
 
-/// Configuration for metrics display
-struct MetricsDisplayConfig {
-    top_ips: usize,
+/// Attach the tracepoint for socket state changes
+fn attach_sock_state_tracepoint(ebpf: &mut Ebpf) -> Result<()> {
+    let program: &mut TracePoint = ebpf
+        .program_mut("bpfhook_sock_state")
+        .context("Failed to find 'bpfhook_sock_state' program")?
+        .try_into()
+        .context("Failed to convert to TracePoint program")?;
+
+    program.load()
+        .context("Failed to load sock:inet_sock_set_state tracepoint")?;
+
+    program.attach("sock", "inet_sock_set_state")
+        .context("Failed to attach sock:inet_sock_set_state tracepoint")?;
+
+    info!("Attached sock:inet_sock_set_state tracepoint");
+    Ok(())
+}
+
+/// Attach the kprobe for accept
+fn attach_accept_kprobe(ebpf: &mut Ebpf) -> Result<()> {
+    let program: &mut KProbe = ebpf
+        .program_mut("bpfhook_accept")
+        .context("Failed to find 'bpfhook_accept' program")?
+        .try_into()
+        .context("Failed to convert to KProbe program")?;
+
+    program.load()
+        .context("Failed to load inet_csk_accept kprobe")?;
+
+    program.attach("inet_csk_accept", 0)
+        .context("Failed to attach inet_csk_accept kprobe")?;
+
+    info!("Attached inet_csk_accept kprobe");
+    Ok(())
+}
+
+/// Get the connection map
+fn get_connection_map(ebpf: &Ebpf) -> Result<HashMap<&MapData, u64, ConnectionInfo>> {
+    HashMap::try_from(
+        ebpf.map("CONNECTION_MAP")
+            .context("Failed to find CONNECTION_MAP")?
+    ).context("Failed to create HashMap from CONNECTION_MAP")
+}
+
+/// Get the cgroup metrics map
+fn get_cgroup_metrics_map(ebpf: &Ebpf) -> Result<HashMap<&MapData, u64, ConnectionMetrics>> {
+    HashMap::try_from(
+        ebpf.map("METRICS_BY_CGROUP")
+            .context("Failed to find METRICS_BY_CGROUP map")?
+    ).context("Failed to create HashMap from METRICS_BY_CGROUP")
+}
+
+/// Get the netns metrics map
+fn get_netns_metrics_map(ebpf: &Ebpf) -> Result<HashMap<&MapData, u64, ConnectionMetrics>> {
+    HashMap::try_from(
+        ebpf.map("METRICS_BY_NETNS")
+            .context("Failed to find METRICS_BY_NETNS map")?
+    ).context("Failed to create HashMap from METRICS_BY_NETNS")
+}
+
+/// Spawn a task to process connection events
+fn spawn_event_processor(ebpf: &mut Ebpf) -> Result<task::JoinHandle<()>> {
+    let mut perf_array = AsyncPerfEventArray::try_from(
+        ebpf.take_map("CONNECTION_EVENTS")
+            .context("Failed to find CONNECTION_EVENTS perf array")?
+    )?;
+
+    let cpus = online_cpus().map_err(|e| anyhow::anyhow!("Failed to get online CPUs: {:?}", e))?;
+    let handle = task::spawn(async move {
+        // Open perf buffers for all CPUs
+        let mut buffers = Vec::new();
+        for cpu_id in cpus {
+            let buf = perf_array.open(cpu_id, None).unwrap();
+            buffers.push(buf);
+        }
+
+        info!("Started connection event processor");
+
+        let bufs = (0..buffers.len())
+            .map(|_| BytesMut::with_capacity(1024))
+            .collect::<Vec<_>>();
+
+        loop {
+            for (i, buf) in buffers.iter_mut().enumerate() {
+                let mut bufvec = vec![bufs[i].clone()];
+                match buf.read_events(&mut bufvec).await {
+                    Ok(_events) => {
+                        for buf in bufvec.iter() {
+                            if buf.len() >= std::mem::size_of::<ConnectionInfo>() {
+                                let ptr = buf.as_ptr() as *const ConnectionInfo;
+                                let conn = unsafe { *ptr };
+                                print_connection_event(&conn);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        trace!("No events or error reading perf buffer: {}", e);
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    });
+
+    Ok(handle)
+}
+
+/// Print a connection event
+fn print_connection_event(conn: &ConnectionInfo) {
+    let src_ip = Ipv4Addr::from(conn.src_addr);
+    let dst_ip = Ipv4Addr::from(conn.dst_addr);
+    let state_name = TCP_STATES.get(conn.state as usize).unwrap_or(&"UNKNOWN");
+
+    let container_tag = if conn.is_container {
+        " [CONTAINER]"
+    } else {
+        ""
+    };
+
+    debug!(
+        "[{}] PID:{} {}:{}->{}:{} state={} cgroup={}{}",
+        chrono::Local::now().format("%H:%M:%S%.3f"),
+        conn.pid,
+        src_ip, conn.src_port,
+        dst_ip, conn.dst_port,
+        state_name,
+        conn.cgroup_id,
+        container_tag
+    );
 }
 
 /// Run the main monitoring loop
 async fn run_monitoring_loop(
-    http_metrics_map: HashMap<&MapData, u16, HttpMetrics>,
-    ip_request_count_map: HashMap<&MapData, u32, u64>,
+    connection_map: HashMap<&MapData, u64, ConnectionInfo>,
+    cgroup_metrics: HashMap<&MapData, u64, ConnectionMetrics>,
+    netns_metrics: HashMap<&MapData, u64, ConnectionMetrics>,
     interval_secs: u64,
-    config: MetricsDisplayConfig,
+    show_containers: bool,
 ) -> Result<()> {
     let mut interval = time::interval(Duration::from_secs(interval_secs));
     let mut shutdown = Box::pin(signal::ctrl_c());
@@ -206,11 +406,11 @@ async fn run_monitoring_loop(
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                display_metrics(&http_metrics_map, &ip_request_count_map, &config)?;
+                display_metrics(&connection_map, &cgroup_metrics, &netns_metrics, show_containers)?;
             }
             _ = &mut shutdown => {
                 info!("\nShutdown signal received. Displaying final metrics...");
-                display_metrics(&http_metrics_map, &ip_request_count_map, &config)?;
+                display_metrics(&connection_map, &cgroup_metrics, &netns_metrics, show_containers)?;
                 break;
             }
         }
@@ -221,201 +421,168 @@ async fn run_monitoring_loop(
 
 /// Display metrics in a formatted report
 fn display_metrics(
-    http_metrics_map: &HashMap<&MapData, u16, HttpMetrics>,
-    ip_request_count_map: &HashMap<&MapData, u32, u64>,
-    config: &MetricsDisplayConfig,
+    connection_map: &HashMap<&MapData, u64, ConnectionInfo>,
+    cgroup_metrics: &HashMap<&MapData, u64, ConnectionMetrics>,
+    netns_metrics: &HashMap<&MapData, u64, ConnectionMetrics>,
+    show_containers: bool,
 ) -> Result<()> {
-    let port_metrics = collect_port_metrics(http_metrics_map)?;
-    let ip_stats = collect_ip_statistics(ip_request_count_map)?;
-
     print_report_header();
-    print_port_metrics(&port_metrics);
-    print_aggregate_metrics(&port_metrics);
-    print_top_ips(&ip_stats, config.top_ips);
 
-    if port_metrics.is_empty() && ip_stats.is_empty() {
-        print_no_data_message();
-    }
+    // Display active connections
+    print_active_connections(connection_map)?;
+
+    // Display cgroup metrics
+    print_cgroup_metrics(cgroup_metrics, show_containers)?;
+
+    // Display network namespace metrics if available
+    print_netns_metrics(netns_metrics)?;
 
     print_report_footer();
     Ok(())
 }
 
-/// Collected metrics for all ports
-struct PortMetricsCollection {
-    by_port: Vec<(u16, HttpMetrics)>,
-    total: HttpMetrics,
-}
-
-impl PortMetricsCollection {
-    fn is_empty(&self) -> bool {
-        self.total.total_requests == 0
-    }
-}
-
-/// Collect metrics from all monitored ports
-fn collect_port_metrics(
-    map: &HashMap<&MapData, u16, HttpMetrics>
-) -> Result<PortMetricsCollection> {
-    let mut by_port = Vec::new();
-    let mut total = HttpMetrics {
-        total_requests: 0,
-        get_requests: 0,
-        post_requests: 0,
-        put_requests: 0,
-        delete_requests: 0,
-        other_requests: 0,
-        bytes_processed: 0,
-        last_updated: 0,
-    };
-
-    for item in map.iter() {
-        let (port, metrics) = item?;
-        by_port.push((port, metrics));
-
-        // Accumulate totals
-        total.total_requests += metrics.total_requests;
-        total.get_requests += metrics.get_requests;
-        total.post_requests += metrics.post_requests;
-        total.put_requests += metrics.put_requests;
-        total.delete_requests += metrics.delete_requests;
-        total.other_requests += metrics.other_requests;
-        total.bytes_processed += metrics.bytes_processed;
-    }
-
-    // Sort by port number
-    by_port.sort_by_key(|&(port, _)| port);
-
-    Ok(PortMetricsCollection { by_port, total })
-}
-
-/// Collect IP request statistics
-fn collect_ip_statistics(
-    map: &HashMap<&MapData, u32, u64>
-) -> Result<Vec<(Ipv4Addr, u64)>> {
-    let mut ip_counts = Vec::new();
-
-    for item in map.iter() {
-        let (ip_u32, count) = item?;
-        let ip = Ipv4Addr::from(ip_u32);
-        ip_counts.push((ip, count));
-    }
-
-    // Sort by count (descending)
-    ip_counts.sort_by(|a, b| b.1.cmp(&a.1));
-
-    Ok(ip_counts)
-}
-
 /// Print the report header
 fn print_report_header() {
     println!("\n{}", "=".repeat(80));
-    println!("HTTP METRICS REPORT");
+    println!("CONNECTION METRICS REPORT");
     println!("{}", "=".repeat(80));
 }
 
 /// Print the report footer
 fn print_report_footer() {
-    println!("\n{}", "=".repeat(80));
+    println!("{}", "=".repeat(80));
 }
 
-/// Print metrics for individual ports
-fn print_port_metrics(metrics: &PortMetricsCollection) {
-    if metrics.by_port.is_empty() {
-        return;
+/// Print active connections
+fn print_active_connections(map: &HashMap<&MapData, u64, ConnectionInfo>) -> Result<()> {
+    let mut connections = Vec::new();
+    let mut container_count = 0;
+    let mut host_count = 0;
+
+    for item in map.iter() {
+        let (_id, conn) = item?;
+        connections.push(conn);
+        if conn.is_container {
+            container_count += 1;
+        } else {
+            host_count += 1;
+        }
     }
 
-    println!("\nPort-based HTTP Metrics:");
+    println!("\nActive Connections:");
     println!("{}", "-".repeat(80));
+    println!("  Total: {} (Host: {}, Container: {})",
+             connections.len(), host_count, container_count);
 
-    for (port, m) in &metrics.by_port {
-        println!("\n  Port {}:", port);
-        println!("    Total Requests:  {}", m.total_requests);
-        println!("    GET Requests:    {}", m.get_requests);
-        println!("    POST Requests:   {}", m.post_requests);
-        println!("    PUT Requests:    {}", m.put_requests);
-        println!("    DELETE Requests: {}", m.delete_requests);
-        println!("    Other Requests:  {}", m.other_requests);
-        println!(
-            "    Bytes Processed: {} ({:.2} MB)",
-            m.bytes_processed,
-            bytes_to_mb(m.bytes_processed)
-        );
-    }
-}
-
-/// Print aggregate metrics across all ports
-fn print_aggregate_metrics(metrics: &PortMetricsCollection) {
-    if metrics.is_empty() {
-        return;
+    // Group by state
+    let mut by_state: BTreeMap<u8, u32> = BTreeMap::new();
+    for conn in &connections {
+        *by_state.entry(conn.state).or_insert(0) += 1;
     }
 
-    let total = &metrics.total;
+    println!("\n  By State:");
+    for (state, count) in by_state {
+        let state_name = TCP_STATES.get(state as usize).unwrap_or(&"UNKNOWN");
+        println!("    {:<15} {}", state_name, count);
+    }
 
-    println!("\nTotal Across All Ports:");
-    println!("{}", "-".repeat(80));
-    println!("  Total Requests:  {}", total.total_requests);
+    // Show sample connections
+    if !connections.is_empty() {
+        println!("\n  Recent Connections (showing first 5):");
+        for conn in connections.iter().take(5) {
+            let src_ip = Ipv4Addr::from(conn.src_addr);
+            let dst_ip = Ipv4Addr::from(conn.dst_addr);
+            let state_name = TCP_STATES.get(conn.state as usize).unwrap_or(&"UNKNOWN");
+            let container_tag = if conn.is_container { " [CTR]" } else { "" };
 
-    // Print method breakdown with percentages
-    print_method_stat("GET", total.get_requests, total.total_requests);
-    print_method_stat("POST", total.post_requests, total.total_requests);
-    print_method_stat("PUT", total.put_requests, total.total_requests);
-    print_method_stat("DELETE", total.delete_requests, total.total_requests);
-    print_method_stat("Other", total.other_requests, total.total_requests);
+            println!("    PID:{:<8} {}:{} -> {}:{} ({}){}",
+                     conn.pid, src_ip, conn.src_port,
+                     dst_ip, conn.dst_port, state_name, container_tag);
+        }
+    }
 
-    println!(
-        "  Total Bytes:     {} ({:.2} MB)",
-        total.bytes_processed,
-        bytes_to_mb(total.bytes_processed)
-    );
+    Ok(())
 }
 
-/// Print a single method statistic with percentage
-fn print_method_stat(name: &str, count: u64, total: u64) {
-    let percentage = if total > 0 {
-        (count as f64 / total as f64) * 100.0
-    } else {
-        0.0
+/// Print cgroup-based metrics
+fn print_cgroup_metrics(map: &HashMap<&MapData, u64, ConnectionMetrics>, show_containers: bool) -> Result<()> {
+    let mut metrics_list = Vec::new();
+    let mut total = ConnectionMetrics {
+        total_connections: 0,
+        active_connections: 0,
+        bytes_sent: 0,
+        bytes_received: 0,
+        http_requests: 0,
+        get_requests: 0,
+        post_requests: 0,
+        put_requests: 0,
+        delete_requests: 0,
+        other_requests: 0,
+        last_updated: 0,
     };
 
-    println!(
-        "  {:<16} {} ({:.1}%)",
-        format!("{} Requests:", name),
-        count,
-        percentage
-    );
-}
+    for item in map.iter() {
+        let (cgroup_id, metrics) = item?;
+        metrics_list.push((cgroup_id, metrics));
 
-/// Print top IPs by request count
-fn print_top_ips(ip_stats: &[(Ipv4Addr, u64)], top_ips: usize) {
-    if ip_stats.is_empty() {
-        return;
+        // Accumulate totals
+        total.total_connections += metrics.total_connections;
+        total.active_connections += metrics.active_connections;
+        total.bytes_sent += metrics.bytes_sent;
+        total.bytes_received += metrics.bytes_received;
     }
 
-    println!("\nTop {} IP Addresses by Request Count:", top_ips);
+    println!("\nCgroup-based Metrics:");
     println!("{}", "-".repeat(80));
-    println!("  {:<20} {:<15} {:<20}", "IP Address", "Requests", "Percentage");
-    println!("  {:<20} {:<15} {:<20}", "-".repeat(18), "-".repeat(13), "-".repeat(18));
 
-    let total_requests: u64 = ip_stats.iter().map(|(_, count)| count).sum();
-
-    for (ip, count) in ip_stats.iter().take(top_ips) {
-        let percentage = (*count as f64 / total_requests as f64) * 100.0;
-        println!("  {:<20} {:<15} {:.1}%", ip, count, percentage);
+    if show_containers {
+        println!("  Individual Cgroups:");
+        for (cgroup_id, metrics) in metrics_list.iter().take(5) {
+            let is_root = *cgroup_id == 1;
+            let cgroup_type = if is_root { "ROOT" } else { "CONTAINER" };
+            println!("\n    Cgroup {} ({}):", cgroup_id, cgroup_type);
+            println!("      Total Connections:  {}", metrics.total_connections);
+            println!("      Active Connections: {}", metrics.active_connections);
+        }
     }
 
-    if ip_stats.len() > top_ips {
-        println!("  ... and {} more IP addresses", ip_stats.len() - top_ips);
+    println!("\n  Aggregate Metrics:");
+    println!("    Total Connections:  {}", total.total_connections);
+    println!("    Active Connections: {}", total.active_connections);
+    if total.bytes_sent > 0 || total.bytes_received > 0 {
+        println!("    Bytes Sent:         {}", total.bytes_sent);
+        println!("    Bytes Received:     {}", total.bytes_received);
     }
+
+    Ok(())
 }
 
-/// Print message when no data is available
-fn print_no_data_message() {
-    println!("\n  No HTTP requests detected yet.");
-    println!("  Make sure HTTP traffic is being sent to the monitored interface.");
-}
+/// Print network namespace metrics
+fn print_netns_metrics(map: &HashMap<&MapData, u64, ConnectionMetrics>) -> Result<()> {
+    let mut has_data = false;
 
-/// Convert bytes to megabytes
-fn bytes_to_mb(bytes: u64) -> f64 {
-    bytes as f64 / 1_048_576.0
+    for item in map.iter() {
+        let (netns_cookie, _metrics) = item?;
+        if netns_cookie != 0 {
+            has_data = true;
+            break;
+        }
+    }
+
+    if !has_data {
+        return Ok(());
+    }
+
+    println!("\nNetwork Namespace Metrics:");
+    println!("{}", "-".repeat(80));
+
+    let mut total_by_ns = 0u64;
+    for item in map.iter() {
+        let (_netns, metrics) = item?;
+        total_by_ns += metrics.total_connections;
+    }
+
+    println!("  Total connections across namespaces: {}", total_by_ns);
+
+    Ok(())
 }
