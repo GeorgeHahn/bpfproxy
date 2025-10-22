@@ -18,7 +18,7 @@ use std::{
     collections::BTreeMap,
     convert::TryFrom,
     net::Ipv4Addr,
-    path::{Path, PathBuf},
+    path::PathBuf,
     time::Duration,
 };
 use tokio::{signal, time, task};
@@ -113,7 +113,7 @@ struct Args {
     #[clap(short = 'p', long)]
     ebpf_path: Option<PathBuf>,
 
-    /// Container name to filter (only intercept connections from this container)
+    /// Container name to intercept (intercept incoming connections to this container)
     #[clap(long)]
     container: Option<String>,
 
@@ -155,12 +155,12 @@ async fn main() -> Result<()> {
 
     info!("eBPF programs attached successfully.");
     if let Some(ref container_name) = args.container {
-        info!("Filtering connections from container: {}", container_name);
+        info!("Intercepting incoming connections to container: {}", container_name);
     } else {
         info!("Monitoring all outbound connections");
     }
     if let Some(ref proxy_addr) = args.proxy {
-        info!("Redirecting to proxy: {}", proxy_addr);
+        info!("Redirecting intercepted connections to proxy: {}", proxy_addr);
     }
     info!("Press Ctrl-C to exit.\n");
 
@@ -195,7 +195,7 @@ async fn main() -> Result<()> {
 }
 
 /// Resolve the path to the eBPF program binary
-fn resolve_ebpf_path(provided_path: Option<&Path>) -> Result<PathBuf> {
+fn resolve_ebpf_path(provided_path: Option<&std::path::Path>) -> Result<PathBuf> {
     // First try provided path
     if let Some(path) = provided_path {
         if path.exists() {
@@ -227,7 +227,7 @@ fn resolve_ebpf_path(provided_path: Option<&Path>) -> Result<PathBuf> {
 }
 
 /// Load the eBPF program from file
-fn load_ebpf_program(path: &Path) -> Result<Ebpf> {
+fn load_ebpf_program(path: &std::path::Path) -> Result<Ebpf> {
     Ebpf::load_file(path)
         .with_context(|| format!("Failed to load eBPF program from {}", path.display()))
 }
@@ -257,6 +257,8 @@ fn attach_cgroup_connect4(ebpf: &mut Ebpf, cgroup_path: &str) -> Result<()> {
     program.load()
         .context("Failed to load cgroup/connect4 program")?;
 
+    // Try using Single mode which creates a bpf_link (required for modern kernels)
+    // This is the proper mode for cgroup/connect4 programs on newer kernels
     program.attach(cgroup, CgroupAttachMode::Single)
         .context("Failed to attach cgroup/connect4 program")?;
 
@@ -372,6 +374,16 @@ fn spawn_event_processor(ebpf: &mut Ebpf) -> Result<task::JoinHandle<()>> {
 fn print_connection_event(conn: &ConnectionInfo) {
     let src_ip = Ipv4Addr::from(conn.src_addr);
     let dst_ip = Ipv4Addr::from(conn.dst_addr);
+
+    // Special handling for debug state (99)
+    if conn.state == 99 {
+        info!(
+            "[DEBUG] Connection attempt to {}:{} (raw: {:#x}) from PID:{}",
+            dst_ip, conn.dst_port, conn.dst_addr, conn.pid
+        );
+        return;
+    }
+
     let state_name = TCP_STATES.get(conn.state as usize).unwrap_or(&"UNKNOWN");
 
     let container_tag = if conn.is_container {
@@ -573,130 +585,60 @@ fn print_netns_metrics(map: &HashMap<&MapData, u64, ConnectionMetrics>) -> Resul
     Ok(())
 }
 
-/// Configure container filtering by populating the ALLOWED_PIDS map
+/// Configure destination-based filtering by populating the INTERCEPTED_DESTINATIONS map
 fn configure_container_filtering(ebpf: &mut Ebpf, container_name: &str) -> Result<()> {
-    // Get container PIDs
-    let pids = get_container_pids(container_name)?;
+    // Get container IP address
+    let container_ip = get_container_ip(container_name)?;
 
-    if pids.is_empty() {
-        anyhow::bail!("No processes found for container: {}", container_name);
-    }
-
-    // Get the ALLOWED_PIDS map
-    let mut allowed_pids: HashMap<_, u32, u8> = HashMap::try_from(
-        ebpf.map_mut("ALLOWED_PIDS")
-            .context("Failed to find ALLOWED_PIDS map")?
-    ).context("Failed to create HashMap from ALLOWED_PIDS")?;
+    // Get the INTERCEPTED_DESTINATIONS map
+    let mut intercepted_destinations: HashMap<_, u32, u16> = HashMap::try_from(
+        ebpf.map_mut("INTERCEPTED_DESTINATIONS")
+            .context("Failed to find INTERCEPTED_DESTINATIONS map")?
+    ).context("Failed to create HashMap from INTERCEPTED_DESTINATIONS")?;
 
     // Add a special key (0) to indicate filtering is enabled
-    allowed_pids.insert(&0u32, &1u8, 0)
-        .context("Failed to enable filtering flag in ALLOWED_PIDS map")?;
+    intercepted_destinations.insert(&0u32, &0u16, 0)
+        .context("Failed to enable filtering flag in INTERCEPTED_DESTINATIONS map")?;
 
-    // Add all PIDs to the map
-    for pid in &pids {
-        allowed_pids.insert(pid, &1u8, 0)
-            .with_context(|| format!("Failed to add PID {} to ALLOWED_PIDS map", pid))?;
-    }
+    // Parse IP address
+    let ip: Ipv4Addr = container_ip.parse()
+        .with_context(|| format!("Invalid IP address: {}", container_ip))?;
+    // Keep in network byte order to match what the BPF program expects
+    let ip_u32 = u32::from(ip);
 
-    info!("Added {} PIDs from container '{}' to filter", pids.len(), container_name);
-    debug!("PIDs: {:?}", pids);
+    // Add the container's IP to the map (port 0 means intercept all ports)
+    intercepted_destinations.insert(&ip_u32, &0u16, 0)
+        .with_context(|| format!("Failed to add IP {} to INTERCEPTED_DESTINATIONS map", container_ip))?;
+
+    info!("Configured to intercept incoming connections to container '{}' at IP {} (u32: {:#x})",
+          container_name, container_ip, ip_u32);
 
     Ok(())
 }
 
-/// Get all PIDs for a given container name
-fn get_container_pids(container_name: &str) -> Result<Vec<u32>> {
-    // Try Docker first
-    if let Ok(pids) = get_docker_container_pids(container_name) {
-        if !pids.is_empty() {
-            return Ok(pids);
-        }
-    }
+// Note: PID-based filtering functions have been removed since we now use
+// destination IP-based filtering for incoming connection interception
 
-    // Try containerd if Docker didn't work
-    if let Ok(pids) = get_containerd_container_pids(container_name) {
-        if !pids.is_empty() {
-            return Ok(pids);
-        }
-    }
-
-    anyhow::bail!("Container '{}' not found. Make sure it's running.", container_name)
-}
-
-/// Get PIDs from Docker container
-fn get_docker_container_pids(container_name: &str) -> Result<Vec<u32>> {
-    // First, get the container ID or use the name directly
+/// Get IP address of a container
+fn get_container_ip(container_name: &str) -> Result<String> {
+    // Use docker inspect to get the IP address
     let output = Command::new("docker")
-        .args(&["inspect", "-f", "{{.State.Pid}}", container_name])
+        .args(&["inspect", "-f", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", container_name])
         .output()?;
 
     if !output.status.success() {
-        return Err(anyhow::anyhow!("Docker inspect failed"));
+        return Err(anyhow::anyhow!("Docker inspect failed for container: {}", container_name));
     }
 
-    let main_pid = String::from_utf8(output.stdout)?
+    let ip = String::from_utf8(output.stdout)?
         .trim()
-        .parse::<u32>()
-        .context("Failed to parse main PID")?;
+        .to_string();
 
-    if main_pid == 0 {
-        return Err(anyhow::anyhow!("Container not running"));
+    if ip.is_empty() {
+        return Err(anyhow::anyhow!("Container '{}' has no IP address. Is it running?", container_name));
     }
 
-    // Get all PIDs in the container's PID namespace
-    let mut pids = vec![main_pid];
-
-    // Read all PIDs from the container's cgroup
-    let cgroup_procs_path = format!("/sys/fs/cgroup/system.slice/docker-{}.scope/cgroup.procs",
-                                   get_docker_container_id(container_name)?);
-
-    if Path::new(&cgroup_procs_path).exists() {
-        let contents = std::fs::read_to_string(&cgroup_procs_path)?;
-        for line in contents.lines() {
-            if let Ok(pid) = line.trim().parse::<u32>() {
-                pids.push(pid);
-            }
-        }
-    } else {
-        // Try alternative cgroup path
-        let alt_path = format!("/sys/fs/cgroup/docker/{}/cgroup.procs",
-                              get_docker_container_id(container_name)?);
-        if Path::new(&alt_path).exists() {
-            let contents = std::fs::read_to_string(&alt_path)?;
-            for line in contents.lines() {
-                if let Ok(pid) = line.trim().parse::<u32>() {
-                    pids.push(pid);
-                }
-            }
-        }
-    }
-
-    Ok(pids)
-}
-
-/// Get full container ID from name
-fn get_docker_container_id(container_name: &str) -> Result<String> {
-    let output = Command::new("docker")
-        .args(&["ps", "-aq", "--filter", &format!("name={}", container_name)])
-        .output()?;
-
-    if !output.status.success() {
-        return Err(anyhow::anyhow!("Docker ps failed"));
-    }
-
-    let id = String::from_utf8(output.stdout)?.trim().to_string();
-    if id.is_empty() {
-        return Err(anyhow::anyhow!("Container not found"));
-    }
-
-    Ok(id)
-}
-
-/// Get PIDs from containerd container (placeholder for now)
-fn get_containerd_container_pids(_container_name: &str) -> Result<Vec<u32>> {
-    // This would need to be implemented based on the containerd runtime
-    // For now, return an error
-    Err(anyhow::anyhow!("Containerd support not yet implemented"))
+    Ok(ip)
 }
 
 /// Configure proxy redirection
@@ -719,6 +661,7 @@ fn configure_proxy_redirection(ebpf: &mut Ebpf, proxy_addr: &str) -> Result<()> 
         .with_context(|| format!("Invalid port: {}", port_str))?;
 
     // Create proxy configuration
+    // Keep IP in network byte order to match what the BPF program expects
     let proxy_config = ProxyConfig {
         proxy_addr: u32::from(ip),
         proxy_port: port,

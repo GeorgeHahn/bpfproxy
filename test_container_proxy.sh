@@ -6,7 +6,7 @@ PROJECT_DIR="$SCRIPT_DIR"
 
 echo "=== BPFHook Container Proxy Test ==="
 echo
-echo "This script demonstrates container filtering and proxy redirection"
+echo "This script demonstrates incoming connection interception to containers"
 echo
 
 # Check if running as root
@@ -33,22 +33,22 @@ while [[ $# -gt 0 ]]; do
             echo "Usage: sudo $0 [options]"
             echo
             echo "Options:"
-            echo "  --container <name>  Container name to filter (only intercept from this container)"
-            echo "  --proxy <IP:PORT>   Proxy address to redirect connections to"
+            echo "  --container <name>  Container to intercept (intercept incoming connections to this container)"
+            echo "  --proxy <IP:PORT>   Proxy address to redirect intercepted connections to"
             echo "  --help              Show this help message"
             echo
             echo "Examples:"
             echo "  # Monitor all connections:"
             echo "  sudo $0"
             echo
-            echo "  # Only intercept connections from 'my-app' container:"
-            echo "  sudo $0 --container my-app"
+            echo "  # Intercept incoming connections to 'target-server' container:"
+            echo "  sudo $0 --container target-server"
             echo
-            echo "  # Redirect all connections to local proxy:"
-            echo "  sudo $0 --proxy 127.0.0.1:8080"
+            echo "  # Redirect intercepted connections to proxy:"
+            echo "  sudo $0 --proxy 172.17.0.4:8888"
             echo
-            echo "  # Filter specific container AND redirect to proxy:"
-            echo "  sudo $0 --container my-app --proxy 127.0.0.1:8080"
+            echo "  # Intercept connections to 'target-server' AND redirect to proxy:"
+            echo "  sudo $0 --container target-server --proxy 172.17.0.4:8888"
             exit 0
             ;;
         *)

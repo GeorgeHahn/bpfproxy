@@ -48,8 +48,8 @@ docker exec source-client curl -s http://target-server:8080/test | jq '.' 2>/dev
 echo
 
 echo -e "${YELLOW}Step 3: Starting BPFHook with transparent proxy redirection${NC}"
-echo "This will intercept traffic from 'source-client' container"
-echo "and redirect it to the proxy at ${PROXY_IP}:8888"
+echo "This will intercept incoming connections to 'target-server' container"
+echo "and redirect them to the proxy at ${PROXY_IP}:8888"
 echo
 
 # Build BPF programs
@@ -68,7 +68,7 @@ EBPF_PATH="$EBPF_BINARY" \
 RUST_LOG=info \
 "$USERSPACE_BINARY" \
     --cgroup-path /sys/fs/cgroup \
-    --container source-client \
+    --container target-server \
     --proxy "${PROXY_IP}:8888" \
     --show-events &
 

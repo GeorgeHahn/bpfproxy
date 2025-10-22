@@ -2,9 +2,9 @@
 
 ## Overview
 
-BPFHook has been modified to focus exclusively on **outbound connection interception** with the ability to:
-1. **Filter by container name** - Only intercept connections from specific containers
-2. **Redirect to proxy** - Transparently redirect connections to a proxy server
+BPFHook has been modified to focus on **incoming connection interception** with the ability to:
+1. **Filter by destination container** - Intercept connections going TO specific containers
+2. **Redirect to proxy** - Transparently redirect intercepted connections to a proxy server
 
 ## Key Changes
 
@@ -13,22 +13,22 @@ BPFHook has been modified to focus exclusively on **outbound connection intercep
 - IPv6 support (can be added later if needed)
 
 ### Added Features
-- **Container filtering**: Specify which container's connections to intercept
+- **Destination-based filtering**: Specify which container's IP to intercept incoming connections to
 - **Proxy redirection**: Redirect intercepted connections to a proxy server
-- **Bulletproof PID tracking**: Tracks all PIDs in a container's namespace
+- **IP-based interception**: Intercepts based on destination IP address
 
 ## Architecture
 
 ### eBPF Maps
-- `ALLOWED_PIDS`: HashMap containing PIDs to intercept (if empty, intercepts all)
+- `INTERCEPTED_DESTINATIONS`: HashMap containing destination IPs to intercept (and optional port filtering)
 - `PROXY_CONFIG`: Configuration for proxy redirection
 
 ### Interception Flow
-1. **cgroup/connect4 hook** intercepts outbound IPv4 connections
-2. Checks if PID filtering is enabled (ALLOWED_PIDS map)
-3. If filtering enabled, only processes connections from allowed PIDs
-4. If proxy configured, modifies destination address to proxy
-5. Tracks original destination for monitoring
+1. **cgroup/connect4 hook** intercepts all outbound IPv4 connections system-wide
+2. Checks if destination IP matches container we want to intercept (INTERCEPTED_DESTINATIONS map)
+3. If destination matches, redirects connection to proxy
+4. Proxy then forwards the connection to the actual target container
+5. Original destination is tracked for monitoring
 
 ## Usage
 
@@ -38,14 +38,14 @@ BPFHook has been modified to focus exclusively on **outbound connection intercep
 # Monitor all outbound connections
 sudo ./test_container_proxy.sh
 
-# Only intercept connections from a specific container
-sudo ./test_container_proxy.sh --container my-app
+# Intercept incoming connections to 'target-server' container
+sudo ./test_container_proxy.sh --container target-server
 
-# Redirect all connections to a proxy
-sudo ./test_container_proxy.sh --proxy 127.0.0.1:8080
+# Redirect intercepted connections to a proxy
+sudo ./test_container_proxy.sh --proxy 172.17.0.4:8888
 
-# Combine: filter by container AND redirect to proxy
-sudo ./test_container_proxy.sh --container my-app --proxy 127.0.0.1:8080
+# Combine: intercept connections to container AND redirect to proxy
+sudo ./test_container_proxy.sh --container target-server --proxy 172.17.0.4:8888
 ```
 
 ### Direct Usage
@@ -53,17 +53,17 @@ sudo ./test_container_proxy.sh --container my-app --proxy 127.0.0.1:8080
 ```bash
 # Using the userspace binary directly
 sudo ./bpfhook-userspace/target/release/bpfhook \
-    --container nginx \
-    --proxy 127.0.0.1:8080 \
+    --container target-server \
+    --proxy 172.17.0.4:8888 \
     --show-events
 ```
 
-## Container Detection
+## Container IP Detection
 
-The system automatically detects container PIDs by:
-1. Getting the main container PID via Docker API
-2. Reading all PIDs from the container's cgroup
-3. Adding all PIDs to the filter map
+The system automatically detects container IP by:
+1. Getting the container's IP address via Docker API
+2. Adding the IP to the INTERCEPTED_DESTINATIONS map
+3. All connections to that IP will be intercepted and redirected
 
 Supported container runtimes:
 - Docker (fully supported)

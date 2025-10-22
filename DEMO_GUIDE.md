@@ -36,7 +36,7 @@ sudo ./demo_transparent_proxy.sh
 This script will:
 1. Start all Docker containers
 2. Test normal connection (without interception)
-3. Start BPFHook to intercept traffic from `source-client`
+3. Start BPFHook to intercept incoming connections to `target-server`
 4. Redirect intercepted traffic to the proxy
 5. Show proxy logs demonstrating the interception
 6. Automatically stop BPFHook at the end
@@ -75,9 +75,9 @@ docker exec source-client curl http://target-server:8080/test
 # Get proxy IP
 PROXY_IP=$(docker inspect proxy-server -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}')
 
-# Start BPFHook
+# Start BPFHook (intercepts incoming connections to target-server)
 sudo ./test_container_proxy.sh \
-    --container source-client \
+    --container target-server \
     --proxy ${PROXY_IP}:8888
 ```
 
@@ -125,30 +125,30 @@ You'll see in the proxy logs:
 
 ## How It Works
 
-1. **BPFHook attaches to cgroup**: The eBPF program hooks into `cgroup/connect4`
-2. **Container filtering**: Only connections from specified container PIDs are intercepted
-3. **Address rewriting**: The destination address is changed to the proxy
-4. **Transparent to application**: The client application (curl) doesn't know it's being redirected
+1. **BPFHook attaches to cgroup**: The eBPF program hooks into `cgroup/connect4` at the root cgroup
+2. **Destination IP filtering**: Connections destined for the specified container's IP are intercepted
+3. **Address rewriting**: When a connection tries to reach the target container, destination is changed to the proxy
+4. **Transparent to both sides**: Neither client nor target container knows about the redirection
 5. **Proxy forwards request**: The proxy receives the connection and forwards to the real target
-6. **Response path**: Response goes proxy → client (reverse path of request)
+6. **Response path**: Response goes target → proxy → client (reverse path of request)
 
 ## Advanced Usage
 
-### Intercept specific containers only
+### Intercept incoming connections to specific containers
 
 ```bash
-# Only intercept nginx container
-sudo ./test_container_proxy.sh --container nginx --proxy 127.0.0.1:8888
+# Intercept connections TO nginx container
+sudo ./test_container_proxy.sh --container nginx --proxy 172.17.0.4:8888
 
-# Only intercept redis container
-sudo ./test_container_proxy.sh --container redis --proxy 127.0.0.1:6379
+# Intercept connections TO redis container
+sudo ./test_container_proxy.sh --container redis --proxy 172.17.0.5:6379
 ```
 
 ### Monitor without redirection
 
 ```bash
-# Just monitor connections, no redirection
-sudo ./test_container_proxy.sh --container source-client
+# Just monitor connections to target-server, no redirection
+sudo ./test_container_proxy.sh --container target-server
 ```
 
 ### Use with external proxy

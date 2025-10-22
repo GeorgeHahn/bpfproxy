@@ -48,40 +48,50 @@ pub struct ProxyConfig {
 // Socket state values from Linux kernel
 const TCP_ESTABLISHED: u8 = 1;
 const TCP_SYN_SENT: u8 = 2;
+#[allow(dead_code)]
 const TCP_SYN_RECV: u8 = 3;
+#[allow(dead_code)]
 const TCP_FIN_WAIT1: u8 = 4;
+#[allow(dead_code)]
 const TCP_FIN_WAIT2: u8 = 5;
+#[allow(dead_code)]
 const TCP_TIME_WAIT: u8 = 6;
 const TCP_CLOSE: u8 = 7;
+#[allow(dead_code)]
 const TCP_CLOSE_WAIT: u8 = 8;
+#[allow(dead_code)]
 const TCP_LAST_ACK: u8 = 9;
+#[allow(dead_code)]
 const TCP_LISTEN: u8 = 10;
+#[allow(dead_code)]
 const TCP_CLOSING: u8 = 11;
 
 // Address families
 const AF_INET: u16 = 2;
+#[allow(dead_code)]
 const AF_INET6: u16 = 10;
 
 // Maps for tracking connections and metrics
 #[map]
-static mut CONNECTION_MAP: LruHashMap<u64, ConnectionInfo> = LruHashMap::with_max_entries(10000, 0);
+static CONNECTION_MAP: LruHashMap<u64, ConnectionInfo> = LruHashMap::with_max_entries(10000, 0);
 
 #[map]
-static mut METRICS_BY_CGROUP: HashMap<u64, ConnectionMetrics> = HashMap::with_max_entries(1024, 0);
+static METRICS_BY_CGROUP: HashMap<u64, ConnectionMetrics> = HashMap::with_max_entries(1024, 0);
 
 #[map]
-static mut METRICS_BY_NETNS: HashMap<u64, ConnectionMetrics> = HashMap::with_max_entries(1024, 0);
+static METRICS_BY_NETNS: HashMap<u64, ConnectionMetrics> = HashMap::with_max_entries(1024, 0);
 
 #[map]
-static mut CONNECTION_EVENTS: PerfEventArray<ConnectionInfo> = PerfEventArray::new(0);
+static CONNECTION_EVENTS: PerfEventArray<ConnectionInfo> = PerfEventArray::new(0);
 
-// Container filtering map - if non-empty, only PIDs in this map are intercepted
+// Destination filtering map - connections to these IPs will be intercepted
+// Key: IPv4 address (u32), Value: Port (u16) - use 0 for any port
 #[map]
-static mut ALLOWED_PIDS: HashMap<u32, u8> = HashMap::with_max_entries(1024, 0);
+static INTERCEPTED_DESTINATIONS: HashMap<u32, u16> = HashMap::with_max_entries(1024, 0);
 
 // Proxy configuration map - stores proxy address to redirect to
 #[map]
-static mut PROXY_CONFIG: HashMap<u32, ProxyConfig> = HashMap::with_max_entries(1, 0);
+static PROXY_CONFIG: HashMap<u32, ProxyConfig> = HashMap::with_max_entries(1, 0);
 
 // Generate unique connection ID from 4-tuple
 #[inline(always)]
@@ -134,17 +144,51 @@ fn try_bpfhook_connect4(ctx: SockAddrContext) -> Result<i32, i64> {
     let tid = pid_tgid as u32;
     let cgroup_id = unsafe { bpf_get_current_cgroup_id() };
 
-    // Check if container filtering is enabled by looking for the PID in the map
-    // If the map is empty (no filtering), the get will return None for all PIDs
+    // Read destination address from context first to check if we should intercept
+    // sock_addr.user_ip4 is in network byte order (big-endian)
+    let orig_dst_addr = sock_addr.user_ip4;
+    let orig_dst_port = sock_addr.user_port as u16;
+
+    // Create a connection event to see what IP we're checking
+    let debug_conn = ConnectionInfo {
+        pid,
+        tid,
+        cgroup_id,
+        netns_cookie: 0,
+        src_addr: 0,
+        dst_addr: orig_dst_addr,  // This will show us what IP we're seeing
+        src_port: 0,
+        dst_port: orig_dst_port,
+        protocol: 6,
+        state: 99,  // Use state 99 as debug marker
+        timestamp: unsafe { bpf_ktime_get_ns() },
+        is_container: true,
+    };
+
+    // Send debug event to userspace
+    CONNECTION_EVENTS.output(&ctx, &debug_conn, BPF_F_CURRENT_CPU as u32);
+
+    // Check if destination filtering is enabled by looking for destinations in the map
     // We use a special key (0) to indicate if filtering is enabled
     unsafe {
         let filter_key = 0u32;
-        let filtering_enabled = ALLOWED_PIDS.get(&filter_key).is_some();
+        let filtering_enabled = INTERCEPTED_DESTINATIONS.get(&filter_key).is_some();
 
         if filtering_enabled {
-            // Check if this specific PID is allowed
-            if ALLOWED_PIDS.get(&pid).is_none() {
-                return Ok(1); // Not intercepting this connection
+            // Debug: Log what IP we're checking
+            // For debugging: convert to see the actual IP
+            let _ip_bytes = orig_dst_addr.to_be_bytes();
+
+            // Check if this destination IP is one we want to intercept
+            if let Some(port) = INTERCEPTED_DESTINATIONS.get(&orig_dst_addr) {
+                // If port is 0, intercept connections to any port on this IP
+                // Otherwise, only intercept if the port matches
+                if *port != 0 && *port != orig_dst_port {
+                    return Ok(1); // Port doesn't match, don't intercept
+                }
+                // Destination matched, continue with interception
+            } else {
+                return Ok(1); // Destination not in our intercept list
             }
         }
     }
@@ -153,26 +197,18 @@ fn try_bpfhook_connect4(ctx: SockAddrContext) -> Result<i32, i64> {
     // So we'll set netns_cookie to 0 and rely on cgroup_id for container attribution
     let netns_cookie = 0u64;
 
-    // Read original destination address from context
-    let orig_dst_addr = u32::from_be(sock_addr.user_ip4);
-    let orig_dst_port = u16::from_be(sock_addr.user_port as u16);
-
     // Check if proxy redirection is enabled
-    let (dst_addr, dst_port) = unsafe {
+    unsafe {
         let key = 0u32;
         if let Some(proxy) = PROXY_CONFIG.get(&key) {
             if proxy.enabled {
                 // Redirect to proxy - modify the destination address
-                sock_addr.user_ip4 = proxy.proxy_addr.to_be();
-                sock_addr.user_port = (proxy.proxy_port as u32).to_be();
-                (proxy.proxy_addr, proxy.proxy_port)
-            } else {
-                (orig_dst_addr, orig_dst_port)
+                // proxy_addr is already in network byte order
+                sock_addr.user_ip4 = proxy.proxy_addr;
+                sock_addr.user_port = proxy.proxy_port as u32;
             }
-        } else {
-            (orig_dst_addr, orig_dst_port)
         }
-    };
+    }
 
     // For connect, source port is usually assigned by kernel, we'll track in state change
     let conn_info = ConnectionInfo {
@@ -192,14 +228,10 @@ fn try_bpfhook_connect4(ctx: SockAddrContext) -> Result<i32, i64> {
 
     // Store connection info
     let conn_id = gen_conn_id(0, orig_dst_addr, 0, orig_dst_port);
-    unsafe {
-        CONNECTION_MAP.insert(&conn_id, &conn_info, 0)?;
-    }
+    CONNECTION_MAP.insert(&conn_id, &conn_info, 0)?;
 
     // Send event to userspace
-    unsafe {
-        CONNECTION_EVENTS.output(&ctx, &conn_info, BPF_F_CURRENT_CPU as u32);
-    }
+    CONNECTION_EVENTS.output(&ctx, &conn_info, BPF_F_CURRENT_CPU as u32);
 
     // Update metrics
     update_metrics(cgroup_id, netns_cookie, true, false);
@@ -226,11 +258,13 @@ fn try_bpfhook_connect4(ctx: SockAddrContext) -> Result<i32, i64> {
 //     __u8 saddr[4];          // 4 bytes at offset 24 (IPv4) or 16 bytes (IPv6)
 //     __u8 daddr[4];          // 4 bytes at offset 40 (IPv4) or 16 bytes (IPv6)
 // }
+#[allow(dead_code)]
 const TRACEPOINT_OFFSET_OLDSTATE: usize = 8;
 const TRACEPOINT_OFFSET_NEWSTATE: usize = 12;
 const TRACEPOINT_OFFSET_SPORT: usize = 16;
 const TRACEPOINT_OFFSET_DPORT: usize = 18;
 const TRACEPOINT_OFFSET_FAMILY: usize = 20;
+#[allow(dead_code)]
 const TRACEPOINT_OFFSET_PROTOCOL: usize = 22;
 const TRACEPOINT_OFFSET_SADDR_IPV4: usize = 24;
 const TRACEPOINT_OFFSET_DADDR_IPV4: usize = 40;
@@ -306,14 +340,10 @@ fn try_bpfhook_sock_state(ctx: TracePointContext) -> Result<u32, i64> {
 
     // Store/update connection info
     let conn_id = gen_conn_id(saddr, daddr, sport, dport);
-    unsafe {
-        CONNECTION_MAP.insert(&conn_id, &conn_info, 0)?;
-    }
+    CONNECTION_MAP.insert(&conn_id, &conn_info, 0)?;
 
     // Send state change event to userspace
-    unsafe {
-        CONNECTION_EVENTS.output(&ctx, &conn_info, BPF_F_CURRENT_CPU as u32);
-    }
+    CONNECTION_EVENTS.output(&ctx, &conn_info, BPF_F_CURRENT_CPU as u32);
 
     // Track metrics for established and closed connections
     if newstate == TCP_ESTABLISHED as i32 {
