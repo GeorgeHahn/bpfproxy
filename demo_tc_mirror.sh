@@ -96,7 +96,7 @@ echo "...output truncated..."
 echo
 
 echo -e "${YELLOW}Step 4: Setting up tc mirred rules${NC}"
-echo "This will mirror all traffic from server's veth to observer's veth"
+echo "This will mirror incoming traffic to the server's veth to observer's veth"
 
 # Add ingress qdisc to server interface
 echo "Adding ingress qdisc to $SERVER_VETH..."
@@ -112,39 +112,38 @@ tc filter add dev "$SERVER_VETH" ingress \
     action mirred egress mirror dev "$OBSERVER_VETH"
 
 # Add egress qdisc and mirror for outgoing traffic from server
-echo "Adding egress qdisc to $SERVER_VETH..."
-tc qdisc add dev "$SERVER_VETH" root handle 1: prio 2>/dev/null || \
-    (tc qdisc del dev "$SERVER_VETH" root 2>/dev/null; tc qdisc add dev "$SERVER_VETH" root handle 1: prio)
-
-echo "Adding mirror rule for outgoing traffic..."
-tc filter add dev "$SERVER_VETH" \
-    parent 1: \
-    protocol all \
-    prio 1 \
-    matchall \
-    action mirred egress mirror dev "$OBSERVER_VETH"
+# NOTE: Egress mirroring is commented out - we only want to see incoming traffic to the server
+# echo "Adding egress qdisc to $SERVER_VETH..."
+# tc qdisc add dev "$SERVER_VETH" root handle 1: prio 2>/dev/null || \
+#     (tc qdisc del dev "$SERVER_VETH" root 2>/dev/null; tc qdisc add dev "$SERVER_VETH" root handle 1: prio)
+#
+# echo "Adding mirror rule for outgoing traffic..."
+# tc filter add dev "$SERVER_VETH" \
+#     parent 1: \
+#     protocol all \
+#     prio 1 \
+#     matchall \
+#     action mirred egress mirror dev "$OBSERVER_VETH"
 
 echo -e "${GREEN}TC mirred rules configured!${NC}"
 echo
 
 # Show the rules
 echo -e "${CYAN}Current TC rules:${NC}"
-echo "Ingress filters on $SERVER_VETH:"
+echo "Ingress filters on $SERVER_VETH (mirroring incoming traffic to server):"
 tc filter show dev "$SERVER_VETH" ingress
 echo
-echo "Egress filters on $SERVER_VETH:"
-tc filter show dev "$SERVER_VETH" parent 1:
-echo
+# Egress filters commented out since we're not mirroring outgoing traffic
+# echo "Egress filters on $SERVER_VETH:"
+# tc filter show dev "$SERVER_VETH" parent 1:
+# echo
 
 echo -e "${BLUE}Step 5: Starting packet capture in observer container${NC}"
 echo "Starting tcpdump in observer container to see mirrored traffic..."
 
-# Start tcpdump in observer container in background
-docker exec -d tc-observer sh -c "tcpdump -i eth0 -nn -l 'host $SERVER_IP' 2>/dev/null | head -20" > /tmp/observer_capture.txt &
-TCPDUMP_PID=$!
-
-# Alternative: Run tcpdump directly
+# Run tcpdump in observer container to capture mirrored packets
 docker exec tc-observer timeout 10 tcpdump -i eth0 -nn -c 20 "host $SERVER_IP or host $CLIENT_IP" 2>/dev/null &
+TCPDUMP_PID=$!
 
 echo
 echo -e "${BLUE}Step 6: Generating traffic from client to server${NC}"
@@ -168,6 +167,9 @@ echo
 echo -e "${YELLOW}Step 8: Verifying mirrored traffic in observer${NC}"
 echo "Running tcpdump in observer to show captured packets..."
 docker exec tc-observer timeout 5 sh -c "tcpdump -i eth0 -nn -c 10 'host $SERVER_IP' 2>/dev/null" || true
+
+# Wait for backgrounded tcpdump to complete before suggesting interactive use
+wait $TCPDUMP_PID 2>/dev/null || true
 
 echo
 echo -e "${BLUE}Step 9: Interactive test${NC}"
