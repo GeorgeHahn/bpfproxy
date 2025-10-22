@@ -6,7 +6,7 @@
 use anyhow::{Context, Result};
 use aya::{
     maps::{HashMap, MapData, AsyncPerfEventArray},
-    programs::{CgroupSockAddr, CgroupAttachMode, TracePoint},
+    programs::{CgroupSockAddr, CgroupAttachMode, KProbe, TracePoint},
     util::online_cpus,
     Ebpf, Pod,
 };
@@ -269,6 +269,79 @@ fn attach_cgroup_connect4(ebpf: &mut Ebpf, cgroup_path: &str) -> Result<()> {
 // IPv6 support (cgroup/connect6) is not currently implemented
 // TODO: Implement attach_cgroup_connect6 when IPv6 support is added
 
+/// Attach kprobes for accept syscalls to intercept incoming connections
+fn attach_accept_kprobes(ebpf: &mut Ebpf) -> Result<()> {
+    // Attach kprobe for accept4
+    {
+        let program: &mut KProbe = ebpf
+            .program_mut("bpfhook_accept4")
+            .context("Failed to find 'bpfhook_accept4' program")?
+            .try_into()
+            .context("Failed to convert to KProbe program")?;
+
+        program.load()
+            .context("Failed to load accept4 kprobe")?;
+
+        program.attach("__sys_accept4", 0)
+            .context("Failed to attach accept4 kprobe")?;
+
+        info!("Attached kprobe for accept4");
+    }
+
+    // Attach kretprobe for accept4
+    {
+        let program: &mut KProbe = ebpf
+            .program_mut("bpfhook_accept4_ret")
+            .context("Failed to find 'bpfhook_accept4_ret' program")?
+            .try_into()
+            .context("Failed to convert to KProbe program")?;
+
+        program.load()
+            .context("Failed to load accept4 kretprobe")?;
+
+        program.attach("__sys_accept4", 0)
+            .context("Failed to attach accept4 kretprobe")?;
+
+        info!("Attached kretprobe for accept4");
+    }
+
+    // Attach kprobe for accept (older syscall)
+    {
+        let program: &mut KProbe = ebpf
+            .program_mut("bpfhook_accept")
+            .context("Failed to find 'bpfhook_accept' program")?
+            .try_into()
+            .context("Failed to convert to KProbe program")?;
+
+        program.load()
+            .context("Failed to load accept kprobe")?;
+
+        program.attach("accept", 0)
+            .context("Failed to attach accept kprobe")?;
+
+        info!("Attached kprobe for accept");
+    }
+
+    // Attach kretprobe for accept
+    {
+        let program: &mut KProbe = ebpf
+            .program_mut("bpfhook_accept_ret")
+            .context("Failed to find 'bpfhook_accept_ret' program")?
+            .try_into()
+            .context("Failed to convert to KProbe program")?;
+
+        program.load()
+            .context("Failed to load accept kretprobe")?;
+
+        program.attach("accept", 0)
+            .context("Failed to attach accept kretprobe")?;
+
+        info!("Attached kretprobe for accept");
+    }
+
+    Ok(())
+}
+
 /// Attach the tracepoint for socket state changes
 fn attach_sock_state_tracepoint(ebpf: &mut Ebpf) -> Result<()> {
     let program: &mut TracePoint = ebpf
@@ -380,6 +453,15 @@ fn print_connection_event(conn: &ConnectionInfo) {
         info!(
             "[DEBUG] Connection attempt to {}:{} (raw: {:#x}) from PID:{}",
             dst_ip, conn.dst_port, conn.dst_addr, conn.pid
+        );
+        return;
+    }
+
+    // Special handling for intercepted incoming connections (state 98)
+    if conn.state == 98 {
+        info!(
+            "[INTERCEPTED] Incoming connection from {}:{} to {}:{} - should redirect to proxy",
+            src_ip, conn.src_port, dst_ip, conn.dst_port
         );
         return;
     }

@@ -4,9 +4,9 @@
 use aya_ebpf::{
     bindings::BPF_F_CURRENT_CPU,
     helpers::{bpf_get_current_cgroup_id, bpf_get_current_pid_tgid, bpf_ktime_get_ns, bpf_probe_read_kernel},
-    macros::{cgroup_sock_addr, map, tracepoint},
+    macros::{cgroup_sock_addr, kprobe, kretprobe, map, tracepoint},
     maps::{HashMap, LruHashMap, PerfEventArray},
-    programs::{SockAddrContext, TracePointContext},
+    programs::{ProbeContext, RetProbeContext, SockAddrContext, TracePointContext},
     EbpfContext,
 };
 
@@ -243,6 +243,125 @@ fn try_bpfhook_connect4(ctx: SockAddrContext) -> Result<i32, i64> {
 // TODO: Add IPv6 support by implementing cgroup/connect6 hook
 // This would require handling IPv6 addresses (128-bit) and updating
 // data structures to support both IPv4 and IPv6
+
+// Map to store socket addresses being accepted
+#[map]
+static ACCEPTING_SOCKS: HashMap<u64, ConnectionInfo> = HashMap::with_max_entries(1024, 0);
+
+// Kprobe for accept4 syscall - this captures incoming connections
+#[kprobe]
+pub fn bpfhook_accept4(ctx: ProbeContext) -> u32 {
+    match try_bpfhook_accept4(ctx) {
+        Ok(ret) => ret,
+        Err(_) => 0,
+    }
+}
+
+fn try_bpfhook_accept4(_ctx: ProbeContext) -> Result<u32, i64> {
+    // Get process info
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let pid = (pid_tgid >> 32) as u32;
+    let tid = pid_tgid as u32;
+    let cgroup_id = unsafe { bpf_get_current_cgroup_id() };
+
+    // Store info about this accept call for processing in kretprobe
+    let conn_info = ConnectionInfo {
+        pid,
+        tid,
+        cgroup_id,
+        netns_cookie: 0,
+        src_addr: 0,
+        dst_addr: 0,
+        src_port: 0,
+        dst_port: 0,
+        protocol: 6, // TCP
+        state: TCP_LISTEN,  // Mark as listening/accepting
+        timestamp: unsafe { bpf_ktime_get_ns() },
+        is_container: is_container_connection(cgroup_id, 0),
+    };
+
+    // Store using pid_tgid as key for retrieval in kretprobe
+    ACCEPTING_SOCKS.insert(&pid_tgid, &conn_info, 0)?;
+
+    Ok(0)
+}
+
+// Kretprobe for accept4 - this is called after the accept completes
+#[kretprobe]
+pub fn bpfhook_accept4_ret(ctx: RetProbeContext) -> u32 {
+    match try_bpfhook_accept4_ret(ctx) {
+        Ok(ret) => ret,
+        Err(_) => 0,
+    }
+}
+
+fn try_bpfhook_accept4_ret(ctx: RetProbeContext) -> Result<u32, i64> {
+    let pid_tgid = bpf_get_current_pid_tgid();
+
+    // Get the stored connection info from kprobe
+    let conn_info = unsafe {
+        match ACCEPTING_SOCKS.get(&pid_tgid) {
+            Some(info) => *info,
+            None => return Ok(0),
+        }
+    };
+
+    // Clean up the temporary storage
+    unsafe {
+        ACCEPTING_SOCKS.remove(&pid_tgid)?;
+    }
+
+    // Check if the accept was successful (return value > 0)
+    // The ret() method returns an Option<T> where T is the return type
+    let ret_val: Option<i64> = ctx.ret();
+    if ret_val.is_none() || ret_val.unwrap() <= 0 {
+        return Ok(0); // Accept failed (returned 0 or negative)
+    }
+
+    // Check if we're monitoring this container
+    if conn_info.is_container {
+        // Log that an incoming connection was accepted
+        let intercept_info = ConnectionInfo {
+            pid: conn_info.pid,
+            tid: conn_info.tid,
+            cgroup_id: conn_info.cgroup_id,
+            netns_cookie: 0,
+            src_addr: 0,  // Will be filled by getpeername if needed
+            dst_addr: 0,  // Will be filled by getsockname if needed
+            src_port: 0,
+            dst_port: 8080,  // Default port, will be filled properly
+            protocol: 6, // TCP
+            state: 98,  // Mark as intercepted incoming connection
+            timestamp: unsafe { bpf_ktime_get_ns() },
+            is_container: true,
+        };
+
+        // Send event to userspace
+        CONNECTION_EVENTS.output(&ctx, &intercept_info, BPF_F_CURRENT_CPU as u32);
+
+        // Update metrics
+        update_metrics(conn_info.cgroup_id, 0, false, true);
+    }
+
+    Ok(0)
+}
+
+// Also hook accept (older syscall)
+#[kprobe]
+pub fn bpfhook_accept(ctx: ProbeContext) -> u32 {
+    match try_bpfhook_accept4(ctx) {
+        Ok(ret) => ret,
+        Err(_) => 0,
+    }
+}
+
+#[kretprobe]
+pub fn bpfhook_accept_ret(ctx: RetProbeContext) -> u32 {
+    match try_bpfhook_accept4_ret(ctx) {
+        Ok(ret) => ret,
+        Err(_) => 0,
+    }
+}
 
 // Tracepoint field offsets for sock:inet_sock_set_state
 // These offsets are for the standard kernel tracepoint structure:
