@@ -1,0 +1,51 @@
+version: '3.8'
+
+services:
+  # Client container that generates traffic to the server
+  client:
+    image: nicolaka/netshoot:latest
+    container_name: tc-client
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    stdin_open: true
+    tty: true
+    command: sleep infinity
+    networks:
+      tc-network:
+        ipv4_address: 172.20.0.10
+
+  # Server container that receives traffic (will be mirrored)
+  server:
+    image: nginx:alpine
+    container_name: tc-server
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    networks:
+      tc-network:
+        ipv4_address: 172.20.0.20
+    ports:
+      - "8080:80"
+
+  # Observer container that receives mirrored traffic
+  observer:
+    image: nicolaka/netshoot:latest
+    container_name: tc-observer
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    stdin_open: true
+    tty: true
+    command: sleep infinity
+    networks:
+      tc-network:
+        ipv4_address: 172.20.0.30
+
+networks:
+  tc-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/24
+          gateway: 172.20.0.1

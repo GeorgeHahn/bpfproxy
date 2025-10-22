@@ -2,6 +2,8 @@
 
 A high-performance eBPF program for monitoring network connections with container attribution, using connection-event hooks instead of interface-based monitoring.
 
+**Also includes**: A simpler TC mirred-based traffic mirroring approach for packet-level traffic observation without eBPF (see [TC Mirred section](#tc-mirred-traffic-mirroring-non-bpf-alternative)).
+
 ## Architecture
 
 This monitor follows **eBPF best practices** by hooking connection events directly rather than interfaces:
@@ -137,6 +139,106 @@ sudo EBPF_PATH=./bpfhook-ebpf/target/bpfel-unknown-none/release/bpfhook \
      --show-containers
 ```
 
+## TC Mirred Traffic Mirroring (Non-BPF Alternative)
+
+This repository also includes a simpler, non-BPF approach for traffic observation using Linux Traffic Control (`tc`) with the `mirred` action. This method mirrors network packets from one container to another for analysis.
+
+### Overview
+
+The TC mirred approach provides packet-level traffic mirroring without requiring eBPF:
+- Uses standard Linux `tc` (traffic control) commands
+- Mirrors traffic at the veth interface level
+- No kernel programming or eBPF required
+- Suitable for packet inspection and traffic analysis scenarios
+
+### Architecture
+
+```
+┌──────────┐         ┌──────────┐         ┌──────────┐
+│  Client  │────────►│  Server  │         │ Observer │
+│Container │         │Container │         │Container │
+└──────────┘         └────┬─────┘         └────▲─────┘
+                          │                     │
+                     veth interface         veth interface
+                          │                     │
+                     ┌────▼─────────────────────┴────┐
+                     │   tc mirred rules             │
+                     │   (mirror packets)            │
+                     └────────────────────────────────┘
+```
+
+### Quick Start
+
+```bash
+# Run the TC mirred demo
+sudo ./demo_tc_mirror.sh
+```
+
+This script will:
+1. Start three containers (client, server, observer)
+2. Set up TC mirred rules to mirror traffic from server to observer
+3. Demonstrate traffic mirroring with live packet capture
+4. Clean up automatically on exit
+
+### How It Works
+
+1. **Veth Interface Discovery**: The script automatically discovers the veth interfaces for containers
+2. **TC Rule Configuration**: Sets up ingress and egress qdiscs with mirred actions
+3. **Packet Mirroring**: All packets passing through the server's veth are copied to the observer's veth
+4. **Traffic Analysis**: The observer container can run tcpdump or any packet analysis tool
+
+### Manual Usage
+
+```bash
+# Start containers
+docker compose -f docker-compose-tc.yml up -d
+
+# Find veth interfaces
+SERVER_VETH=$(docker exec tc-server cat /sys/class/net/eth0/iflink)
+OBSERVER_VETH=$(docker exec tc-observer cat /sys/class/net/eth0/iflink)
+
+# Set up mirroring (ingress)
+tc qdisc add dev veth${SERVER_VETH} ingress
+tc filter add dev veth${SERVER_VETH} ingress \
+    protocol all prio 1 matchall \
+    action mirred egress mirror dev veth${OBSERVER_VETH}
+
+# Set up mirroring (egress)
+tc qdisc add dev veth${SERVER_VETH} root handle 1: prio
+tc filter add dev veth${SERVER_VETH} parent 1: \
+    protocol all prio 1 matchall \
+    action mirred egress mirror dev veth${OBSERVER_VETH}
+
+# Monitor in observer container
+docker exec -it tc-observer tcpdump -i eth0 -nn
+```
+
+### Use Cases
+
+The TC mirred approach is ideal for:
+- **Traffic Analysis**: Inspect packets without modifying application code
+- **Debugging**: Observe actual network traffic between containers
+- **Security Monitoring**: Non-invasive traffic inspection
+- **Protocol Analysis**: Capture and analyze application protocols
+
+### Comparison with eBPF Approach
+
+| Feature | eBPF Monitoring | TC Mirred |
+|---------|----------------|-----------|
+| **Complexity** | High (requires kernel programming) | Low (standard Linux commands) |
+| **Performance** | Very high (in-kernel processing) | Good (packet copying overhead) |
+| **Granularity** | Connection-level with metrics | Packet-level raw data |
+| **Attribution** | Process/container attribution | No process attribution |
+| **Filtering** | Programmable in-kernel filters | Basic TC filters |
+| **Use Case** | Connection monitoring & metrics | Packet inspection & analysis |
+
+### Requirements
+
+- Linux kernel with TC support (standard in all modern distributions)
+- Docker or container runtime
+- Root privileges for TC configuration
+- iproute2 package (provides `tc` command)
+
 ## Docker Test Environment
 
 The project includes Docker containers for testing:
@@ -190,7 +292,8 @@ Cgroup-based Metrics:
 
 - `bpfhook-userspace/` - Userspace loader and monitor program
 - `bpfhook-ebpf/` - eBPF kernel programs (cgroup, tracepoint, kprobe)
-- `docker-compose.yml` - Test container setup
+- `docker-compose-tc.yml` - Test container setup for TC mirred demo
+- `demo_tc_mirror.sh` - TC mirred traffic mirroring demo script
 - `scripts/` - Utility scripts for monitoring and testing
   - `monitor.sh` - Connection monitoring script
   - `traffic-gen.sh` - Traffic generation script
