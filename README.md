@@ -1,25 +1,26 @@
 # BPF Hook - Connection Monitor with Container Attribution
 
-A high-performance eBPF program for monitoring network connections with container attribution, using connection-event hooks instead of interface-based monitoring.
+A collection of concepts for container traffic snooping. The goal here was to transparently capture a specific container's incoming network and UDS traffic for later replay and analysis.
 
-**Also includes**: A simpler TC mirred-based traffic mirroring approach for packet-level traffic observation without eBPF (see [TC Mirred section](#tc-mirred-traffic-mirroring-non-bpf-alternative)).
+## Proofs of Concept
 
-## Architecture
+A BPF program for monitoring network connections with container attribution.
 
-This monitor follows **eBPF best practices** by hooking connection events directly rather than interfaces:
+A simpler TC mirred-based traffic mirroring approach for packet-level traffic observation without eBPF (see [TC Mirred section](#tc-mirred-traffic-mirroring-non-bpf-alternative)).
 
-- **Outbound connections**: `cgroup/connect4` hook for IPv4 (BPF_CGROUP_SOCK_ADDR)
-- **State changes**: `tracepoint sock:inet_sock_set_state` for tracking connection lifecycle
+## BPF Hook Architecture
+
 - **Inbound connections**: `kprobe` on `inet_csk_accept` for accepted connections
+- **State changes**: `tracepoint sock:inet_sock_set_state` for tracking connection lifecycle
 - **Container attribution**: Uses cgroup ID (`bpf_get_current_cgroup_id()`) and network namespace cookies (`bpf_get_netns_cookie()`)
 
-**Note**: Currently only IPv4 connections are monitored. IPv6 support is planned for a future release.
+**Note**: Currently only IPv4 connections are monitored.
 
-This approach provides:
-- ✅ Interface-independent monitoring
-- ✅ Container/process attribution
-- ✅ Connection lifecycle tracking
-- ✅ Works across all network topologies (veth, bridge, host networking)
+Aims to provide
+- Interface-independent monitoring
+- Container/process attribution
+- Connection lifecycle tracking
+- Support for all network topologies (veth, bridge, host networking)
 
 ## Prerequisites
 
