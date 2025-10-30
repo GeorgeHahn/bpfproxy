@@ -1,3 +1,5 @@
+Note: the `tc` changes in this repo are half-complete. The repo is in a better state at commit ed043b7b.
+
 # BPF Hook - Connection Monitor with Container Attribution
 
 A collection of concepts for container traffic snooping. The goal here was to transparently capture a specific container's incoming network and UDS traffic for later replay and analysis.
